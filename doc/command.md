@@ -21,4 +21,11 @@ python -m robohive.utils.examine_env \
 
 讨论：当前 stable baseline3 的官方要求是 3.10+，老版本例如 1.8.0 虽然支持 py 3.8，但是其内部调用存在冲突
 
+# Task1.2
+base: /data/Project/robohive 中的内容通过 conda 环境 robohive 运行
+base: 本机装有 cuda 但是你可能没有权限检测到；涉及训练工作请启用 cuda
+目前我们的代码只是单个环境，没有吃满 gpu 的资源，能否对 scripts/remove.py 进行修改，让其支持并行训练，以增加训练效率。注意使用新的 py 文件
+
+对 scripts/remove.py 和 scripts/train_parallel.py 添加功能，实现中途 checkpoint 和周期性 eval
+
 # Command
