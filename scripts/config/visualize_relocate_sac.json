@@ -1,0 +1,10 @@
+{
+  "env_id": "relocate-v1",
+  "model_path": "runs/relocate_sac/sac_relocate.zip",
+  "device": "cuda",
+  "seed": 123,
+  "episodes": 3,
+  "horizon": 200,
+  "sleep": 0.01,
+  "deterministic": true
+}

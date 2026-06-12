@@ -1,0 +1,25 @@
+{
+  "env_id": "relocate-v1",
+  "seed": 0,
+  "run_dir": "runs/relocate_sac_time4m_bs1024_eval20_seed0",
+  "monitor_filename": "train_monitor.csv",
+  "model_name": "sac_relocate_4m_bs1024",
+  "policy": "MlpPolicy",
+  "device": "cuda",
+  "verbose": 1,
+  "total_timesteps": 4000000,
+  "eval_episodes": 20,
+  "deterministic_eval": true,
+  "info_keywords": ["solved"],
+  "sac": {
+    "buffer_size": 1000000,
+    "learning_starts": 50000,
+    "batch_size": 1024,
+    "train_freq": 1,
+    "gradient_steps": 1,
+    "learning_rate": 0.0003,
+    "gamma": 0.99,
+    "tau": 0.005,
+    "ent_coef": "auto"
+  }
+}
