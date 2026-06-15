@@ -28,4 +28,11 @@ base: 本机装有 cuda 但是你可能没有权限检测到；涉及训练工�
 
 对 scripts/remove.py 和 scripts/train_parallel.py 添加功能，实现中途 checkpoint 和周期性 eval
 
+python scripts/train_shadowhand_inhand_algos.py --list-tasks
+
+python scripts/train_shadowhand_inhand_algos.py \
+  --config scripts/config/pen/train_pen_ppo_parallel.json
+python scripts/visualize_algos.py \
+  --config scripts/config/pen/visualize_pen_ppo.json
+
 # Command

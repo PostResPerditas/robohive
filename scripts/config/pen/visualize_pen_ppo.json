@@ -1,0 +1,13 @@
+{
+  "train_config": "scripts/config/pen/train_pen_ppo_parallel.json",
+  "algorithm": "PPO",
+  "model_choice": "best",
+  "device": "cuda",
+  "episodes": 5,
+  "horizon": 100,
+  "seed": 123,
+  "deterministic": true,
+  "render": true,
+  "sleep": 0.01,
+  "summary_csv": "runs/pen_ppo_visual_eval.csv"
+}

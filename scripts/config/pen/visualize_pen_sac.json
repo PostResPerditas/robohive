@@ -1,0 +1,13 @@
+{
+  "train_config": "scripts/config/pen/train_pen_sac_parallel.json",
+  "algorithm": "SAC",
+  "model_choice": "best",
+  "device": "cuda",
+  "episodes": 5,
+  "horizon": 100,
+  "seed": 123,
+  "deterministic": true,
+  "render": true,
+  "sleep": 0.01,
+  "summary_csv": "runs/pen_sac_visual_eval.csv"
+}

@@ -1,0 +1,33 @@
+{
+  "algorithm": "SAC",
+  "env_id": "relocate-v1",
+  "seed": 0,
+  "run_dir": "runs/relocate_sac_parallel_env4_stable_15m_seed0",
+  "monitor_filename": "train_monitor.csv",
+  "model_name": "sac_relocate_parallel_env4_stable_15m",
+  "policy": "MlpPolicy",
+  "device": "cuda",
+  "verbose": 1,
+  "total_timesteps": 1500000,
+  "n_envs": 4,
+  "vec_env": "subproc",
+  "start_method": "forkserver",
+  "eval_episodes": 20,
+  "eval_freq": 50000,
+  "checkpoint_freq": 100000,
+  "deterministic_eval": true,
+  "info_keywords": ["solved"],
+  "save_replay_buffer": false,
+  "save_vecnormalize": false,
+  "sac": {
+    "buffer_size": 1000000,
+    "learning_starts": 50000,
+    "batch_size": 256,
+    "train_freq": 1,
+    "gradient_steps": 1,
+    "learning_rate": 0.0001,
+    "gamma": 0.99,
+    "tau": 0.005,
+    "ent_coef": "auto_0.1"
+  }
+}
