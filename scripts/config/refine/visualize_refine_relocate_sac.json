@@ -1,0 +1,13 @@
+{
+  "train_config": "scripts/config/refine/train_refine_relocate_sac_gravity_curriculum.json",
+  "algorithm": "SAC",
+  "model_choice": "final",
+  "device": "cuda",
+  "episodes": 5,
+  "horizon": 200,
+  "seed": 123,
+  "deterministic": true,
+  "render": true,
+  "sleep": 0.01,
+  "summary_csv": "runs/refine_relocate_sac_gravity_curriculum_env4_seed0/visual_eval.csv"
+}

@@ -38,6 +38,9 @@ import robohive  # noqa: F401  # importing registers RoboHive envs
 from robohive.utils import gym as rhgym
 from stable_baselines3 import A2C, DDPG, PPO, SAC, TD3
 
+from refine_grasp_reset_wrapper import RefineGraspResetWrapper
+from refine_tabletop_env import make_refine_tabletop_env
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "config" / "pen" / "train_pen_ppo_parallel.json"
@@ -168,11 +171,36 @@ def infer_model_path(config: Dict[str, Any], algorithm: str) -> Path:
 
 
 def build_env(config: Dict[str, Any]) -> Tuple[RoboHiveSB3Compat, Any]:
-    raw_env = rhgym.make(
-        config["env_id"],
-        seed=int(config.get("seed", 123)),
-        disable_env_checker=True,
+    if config["env_id"] == "refine-tabletop-v1":
+        raw_env = make_refine_tabletop_env(
+            config.get("eval_refine_tabletop", config.get("refine_tabletop", {})),
+            seed=int(config.get("seed", 123)),
+        )
+    else:
+        raw_env = rhgym.make(
+            config["env_id"],
+            seed=int(config.get("seed", 123)),
+            disable_env_checker=True,
+        )
+    refine_grasp_reset = config.get(
+        "eval_refine_grasp_reset", config.get("refine_grasp_reset", None)
     )
+    if refine_grasp_reset and refine_grasp_reset.get("enabled", False):
+        raw_env = RefineGraspResetWrapper(
+            raw_env,
+            refine_grasp_reset,
+            seed=int(config.get("seed", 123)),
+        )
+
+    gravity_vector = config.get("eval_gravity_vector", config.get("gravity_vector", None))
+    if gravity_vector is not None:
+        gravity_scale = float(config.get("eval_gravity_scale", config.get("gravity_scale", 1.0)))
+        base_env = raw_env.unwrapped
+        if hasattr(base_env, "sim"):
+            base_env.sim.model.opt.gravity[:] = np.asarray(gravity_vector) * gravity_scale
+        elif hasattr(base_env, "model"):
+            base_env.model.opt.gravity[:] = np.asarray(gravity_vector) * gravity_scale
+
     env = RoboHiveSB3Compat(raw_env)
     return env, raw_env
 
@@ -231,6 +259,7 @@ def visualize(config: Dict[str, Any]):
     print(f"horizon={horizon}")
     print(f"deterministic={deterministic}")
     print(f"render={render_enabled}")
+    print(f"refine_grasp_reset={config.get('refine_grasp_reset', {})}")
 
     rows = []
     solved_count = 0

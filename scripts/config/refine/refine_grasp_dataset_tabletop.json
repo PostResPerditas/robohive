@@ -1,0 +1,14 @@
+{
+  "stability_json": "/data/Project/Grasp_Refine/grasp_refine/refine/outputs/grasp_generation_release/evaluation/mujoco_stability/release_grasp_set_mujoco_stability.json",
+  "output_dir": "runs/refine_grasps/tabletop_stable",
+  "mode": "tabletop",
+  "qpos_key": "grasp_qpos",
+  "require_success": true,
+  "require_gravity_success": true,
+  "max_trans": 0.05,
+  "max_trans_metric": "gravity_max_trans",
+  "max_rot_deg": 15.0,
+  "max_rot_metric": "gravity_max_rot_deg",
+  "min_final_contact_groups": 1,
+  "max_count": 0
+}

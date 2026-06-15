@@ -1,0 +1,630 @@
+import copy
+import hashlib
+import json
+import math
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+import gymnasium
+import mujoco
+import mujoco.viewer
+import numpy as np
+from gymnasium import spaces
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_HAND_XML = Path(
+    "/data/Project/Grasp_Refine/grasp_refine/assets/hand/shadow/right.xml"
+)
+DEFAULT_MODEL_DIR = PROJECT_ROOT / "runs" / "refine_tabletop_models"
+
+REFINE_JOINT_NAMES = [
+    "rh_FFJ4",
+    "rh_FFJ3",
+    "rh_FFJ2",
+    "rh_FFJ1",
+    "rh_MFJ4",
+    "rh_MFJ3",
+    "rh_MFJ2",
+    "rh_MFJ1",
+    "rh_RFJ4",
+    "rh_RFJ3",
+    "rh_RFJ2",
+    "rh_RFJ1",
+    "rh_LFJ5",
+    "rh_LFJ4",
+    "rh_LFJ3",
+    "rh_LFJ2",
+    "rh_LFJ1",
+    "rh_THJ5",
+    "rh_THJ4",
+    "rh_THJ3",
+    "rh_THJ2",
+    "rh_THJ1",
+]
+
+ACTUATOR_NAMES = [
+    "rh_A_THJ5",
+    "rh_A_THJ4",
+    "rh_A_THJ3",
+    "rh_A_THJ2",
+    "rh_A_THJ1",
+    "rh_A_FFJ4",
+    "rh_A_FFJ3",
+    "rh_A_FFJ0",
+    "rh_A_MFJ4",
+    "rh_A_MFJ3",
+    "rh_A_MFJ0",
+    "rh_A_RFJ4",
+    "rh_A_RFJ3",
+    "rh_A_RFJ0",
+    "rh_A_LFJ5",
+    "rh_A_LFJ4",
+    "rh_A_LFJ3",
+    "rh_A_LFJ0",
+]
+
+def resolve_project_path(path: Optional[str]) -> Optional[Path]:
+    if path is None or str(path) == "":
+        return None
+    path = Path(path).expanduser()
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def load_json(path: Path) -> Dict[str, Any]:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def as_vec(value, size: int, name: str) -> np.ndarray:
+    arr = np.asarray(value, dtype=np.float64).reshape(-1)
+    if arr.size != size:
+        raise ValueError(f"{name} must have {size} values, got {arr.size}")
+    return arr
+
+
+def vec_str(values) -> str:
+    return " ".join(f"{float(v):.9g}" for v in np.asarray(values).reshape(-1))
+
+
+def quat_normalize(quat) -> np.ndarray:
+    quat = as_vec(quat, 4, "quat")
+    norm = np.linalg.norm(quat)
+    if norm < 1e-8:
+        return np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    quat = quat / norm
+    return quat if quat[0] >= 0 else -quat
+
+
+def quat_mul(qa, qb) -> np.ndarray:
+    qa = quat_normalize(qa)
+    qb = quat_normalize(qb)
+    return quat_normalize(
+        np.asarray(
+            [
+                qa[0] * qb[0] - qa[1] * qb[1] - qa[2] * qb[2] - qa[3] * qb[3],
+                qa[0] * qb[1] + qa[1] * qb[0] + qa[2] * qb[3] - qa[3] * qb[2],
+                qa[0] * qb[2] - qa[1] * qb[3] + qa[2] * qb[0] + qa[3] * qb[1],
+                qa[0] * qb[3] + qa[1] * qb[2] - qa[2] * qb[1] + qa[3] * qb[0],
+            ],
+            dtype=np.float64,
+        )
+    )
+
+
+def quat_conj(quat) -> np.ndarray:
+    quat = quat_normalize(quat)
+    return np.asarray([quat[0], -quat[1], -quat[2], -quat[3]], dtype=np.float64)
+
+
+def quat_error_angle(qa, qb) -> float:
+    qa = quat_normalize(qa)
+    qb = quat_normalize(qb)
+    dot = abs(float(np.dot(qa, qb)))
+    return 2.0 * math.acos(float(np.clip(dot, -1.0, 1.0)))
+
+
+def axis_angle_quat(axis, angle) -> np.ndarray:
+    axis = as_vec(axis, 3, "axis")
+    norm = np.linalg.norm(axis)
+    if norm < 1e-8:
+        return np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    axis = axis / norm
+    half = 0.5 * float(angle)
+    return quat_normalize([math.cos(half), *(math.sin(half) * axis)])
+
+
+def xml_children(parent, tag):
+    child = parent.find(tag)
+    return list(child) if child is not None else []
+
+
+class RefineTabletopEnv(gymnasium.Env):
+    """Fixed-base ShadowHand tabletop env built from Grasp_Refine assets."""
+
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 50}
+
+    def __init__(self, config: Dict[str, Any], seed: Optional[int] = None):
+        super().__init__()
+        self.config = dict(config)
+        self.rng = np.random.RandomState(seed if seed is not None else self.config.get("seed", 0))
+        self.frame_skip = int(self.config.get("frame_skip", 5))
+        self.horizon = int(self.config.get("horizon", 200))
+        self.step_count = 0
+        self.viewer = None
+
+        manifest_path = resolve_project_path(self.config.get("manifest_path"))
+        if manifest_path is None:
+            raise ValueError("refine_tabletop.manifest_path is required")
+        self.manifest = load_json(manifest_path)
+        self.entries = list(self.manifest.get("entries", []))
+        if not self.entries:
+            raise ValueError(f"No entries in manifest: {manifest_path}")
+
+        self.initial_index = int(self.config.get("initial_grasp_index", 0))
+        self.initial_entry = self.entries[self.initial_index]
+        self.target_entry = self._resolve_target_entry()
+        if self.target_entry.get("object_name") != self.initial_entry.get("object_name"):
+            raise ValueError("initial_grasp_index and target_grasp_index must use the same object_name")
+
+        self.hand_xml = resolve_project_path(self.config.get("hand_xml")) or DEFAULT_HAND_XML
+        self.model_xml_path = self._build_model_xml()
+        self.model = mujoco.MjModel.from_xml_path(str(self.model_xml_path))
+        self.data = mujoco.MjData(self.model)
+        self._cache_ids()
+
+        self.init_hand_qpos = as_vec(self.initial_entry["refine_finger_qpos22"], 22, "init hand qpos")
+        self.init_object_pose = as_vec(
+            self.initial_entry.get("object_scene_pose_wxyz", self.initial_entry["object_pose_world_wxyz"]),
+            7,
+            "init object pose",
+        )
+        self.target_hand_qpos = as_vec(
+            self.target_entry.get("refine_finger_qpos22", self.initial_entry["refine_finger_qpos22"]),
+            22,
+            "target hand qpos",
+        )
+        self.target_object_pose = self._target_object_pose()
+
+        self.ctrl_low = self.model.actuator_ctrlrange[:, 0].astype(np.float64)
+        self.ctrl_high = self.model.actuator_ctrlrange[:, 1].astype(np.float64)
+        self.ctrl_limited = np.asarray(self.model.actuator_ctrllimited, dtype=bool)
+        self.default_ctrl = self._initial_ctrl_from_qpos(self.init_hand_qpos)
+        self.action_mode = str(self.config.get("action_mode", "delta")).lower()
+        self.action_scale = float(self.config.get("action_scale", 0.15))
+        self.action_space = spaces.Box(-1.0, 1.0, shape=(self.model.nu,), dtype=np.float32)
+        obs = self._get_obs()
+        self.observation_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=obs.shape,
+            dtype=np.float32,
+        )
+
+        self.set_gravity_vector(
+            self.config.get("gravity_vector", [0.0, -9.81, 0.0]),
+            gravity_scale=float(self.config.get("gravity_scale", 1.0)),
+        )
+
+    def seed(self, seed=None):
+        if seed is not None:
+            self.rng.seed(seed)
+        return [seed]
+
+    @property
+    def unwrapped(self):
+        return self
+
+    def _resolve_target_entry(self) -> Dict[str, Any]:
+        target_index = self.config.get("target_grasp_index", None)
+        if target_index is None:
+            return self.initial_entry
+        return self.entries[int(target_index)]
+
+    def _target_object_pose(self) -> np.ndarray:
+        if self.config.get("target_object_pose_wxyz") is not None:
+            return as_vec(self.config["target_object_pose_wxyz"], 7, "target_object_pose_wxyz")
+        pose = as_vec(
+            self.target_entry.get("object_scene_pose_wxyz", self.target_entry["object_pose_world_wxyz"]),
+            7,
+            "target object pose",
+        ).copy()
+        if self.config.get("target_relative_axis") is not None:
+            axis = as_vec(self.config.get("target_relative_axis"), 3, "target_relative_axis")
+            angle = float(self.config.get("target_relative_angle", 0.0))
+            pose[3:7] = quat_mul(axis_angle_quat(axis, angle), pose[3:7])
+        return pose
+
+    def _build_model_xml(self) -> Path:
+        model_dir = resolve_project_path(self.config.get("model_dir")) or DEFAULT_MODEL_DIR
+        model_dir.mkdir(parents=True, exist_ok=True)
+        xml_key = json.dumps(
+            {
+                "object": self.initial_entry.get("object_name"),
+                "object_xml": self.initial_entry.get("object_xml_path"),
+                "scale": self.initial_entry.get("object_scale"),
+                "hand_pose": self.initial_entry.get("refine_hand_pose_world_wxyz"),
+                "hand_xml": str(self.hand_xml),
+                "collision_filter": self.config.get("collision_filter", "object_hand_table"),
+                "schema": 2,
+            },
+            sort_keys=True,
+        )
+        xml_hash = hashlib.sha1(xml_key.encode("utf-8")).hexdigest()[:12]
+        xml_path = model_dir / f"refine_tabletop_{xml_hash}.xml"
+        if xml_path.exists() and not bool(self.config.get("force_rebuild_xml", False)):
+            return xml_path
+
+        hand_root = ET.parse(self.hand_xml).getroot()
+        object_xml = Path(self.initial_entry["object_xml_path"])
+        object_root = ET.parse(object_xml).getroot()
+
+        root = ET.Element("mujoco", {"model": "refine_tabletop_fixed_base"})
+        compiler = copy.deepcopy(hand_root.find("compiler"))
+        if compiler is None:
+            compiler = ET.Element("compiler", {"angle": "radian", "autolimits": "true"})
+        hand_meshdir = self.hand_xml.parent / compiler.get("meshdir", ".")
+        compiler.set("meshdir", str(hand_meshdir.resolve()))
+        root.append(compiler)
+        ET.SubElement(
+            root,
+            "option",
+            {
+                "timestep": str(float(self.config.get("timestep", 0.002))),
+                "cone": "elliptic",
+                "impratio": "10",
+                "gravity": vec_str(self.config.get("gravity_vector", [0.0, -9.81, 0.0])),
+            },
+        )
+        ET.SubElement(root, "size", {"njmax": "1000", "nconmax": "300"})
+
+        for child in xml_children(hand_root, "default"):
+            default_root = root.find("default")
+            if default_root is None:
+                default_root = ET.SubElement(root, "default")
+            default_root.append(copy.deepcopy(child))
+
+        asset = ET.SubElement(root, "asset")
+        for child in xml_children(hand_root, "asset"):
+            asset.append(copy.deepcopy(child))
+        object_mesh_prefix = "objmesh_"
+        object_meshdir = object_xml.parent / object_root.find("compiler").get("meshdir", ".")
+        object_mesh_scale = as_vec(self.initial_entry.get("object_scale", [1.0, 1.0, 1.0]), 3, "object_scale")
+        mesh_name_map = {}
+        for mesh in object_root.findall("./asset/mesh"):
+            mesh_copy = copy.deepcopy(mesh)
+            old_name = mesh_copy.get("name")
+            new_name = object_mesh_prefix + old_name
+            mesh_name_map[old_name] = new_name
+            mesh_copy.set("name", new_name)
+            mesh_copy.set("file", str((object_meshdir / mesh_copy.get("file")).resolve()))
+            mesh_copy.set("scale", vec_str(object_mesh_scale))
+            asset.append(mesh_copy)
+
+        worldbody = ET.SubElement(root, "worldbody")
+        ET.SubElement(worldbody, "light", {"pos": "0 -1 1", "dir": "0 1 -1", "diffuse": "0.8 0.8 0.8"})
+        ET.SubElement(worldbody, "camera", {"name": "fixed", "pos": "0 -0.55 0.55", "euler": "0.8 0 0"})
+        table_pose = as_vec(self.initial_entry.get("table_pose_wxyz", [0, 0, 0, 1, 0, 0, 0]), 7, "table_pose")
+        table_size = as_vec(self.initial_entry.get("table_size", [0.34, 0.34, 0.01]), 3, "table_size")
+        ET.SubElement(
+            worldbody,
+            "geom",
+            {
+                "name": "table",
+                "type": "plane",
+                "pos": vec_str(table_pose[:3]),
+                "quat": vec_str(table_pose[3:7]),
+                "size": vec_str(table_size),
+                "friction": "1 0.5 0.01",
+                "contype": "4",
+                "conaffinity": "2",
+            },
+        )
+
+        hand_pose = as_vec(self.initial_entry["refine_hand_pose_world_wxyz"], 7, "hand pose")
+        fixed_hand = ET.SubElement(
+            worldbody,
+            "body",
+            {
+                "name": "fixed_hand_base",
+                "pos": vec_str(hand_pose[:3]),
+                "quat": vec_str(hand_pose[3:7]),
+            },
+        )
+        for child in xml_children(hand_root, "worldbody"):
+            hand_child = copy.deepcopy(child)
+            self._apply_hand_collision_filter(hand_child)
+            fixed_hand.append(hand_child)
+
+        object_pose = as_vec(
+            self.initial_entry.get("object_scene_pose_wxyz", self.initial_entry["object_pose_world_wxyz"]),
+            7,
+            "object pose",
+        )
+        object_body = ET.SubElement(
+            worldbody,
+            "body",
+            {"name": "Object", "pos": vec_str(object_pose[:3]), "quat": vec_str(object_pose[3:7])},
+        )
+        ET.SubElement(object_body, "freejoint", {"name": "object_freejoint"})
+        density = str(float(self.config.get("object_density", 1000.0)))
+        for geom in object_root.findall("./worldbody/body/geom"):
+            geom_copy = copy.deepcopy(geom)
+            if geom_copy.get("name"):
+                geom_copy.set("name", "obj_" + geom_copy.get("name"))
+            if geom_copy.get("mesh") in mesh_name_map:
+                geom_copy.set("mesh", mesh_name_map[geom_copy.get("mesh")])
+            if geom_copy.get("contype", "1") != "0":
+                geom_copy.set("density", density)
+                geom_copy.set("condim", "4")
+                geom_copy.set("friction", "1 0.5 0.01")
+                geom_copy.set("margin", str(float(self.config.get("object_margin", 0.0))))
+                geom_copy.set("contype", "2")
+                geom_copy.set("conaffinity", "5")
+            object_body.append(geom_copy)
+
+        target_pose = self._target_object_pose_from_entries()
+        ET.SubElement(
+            worldbody,
+            "site",
+            {
+                "name": "target",
+                "type": "sphere",
+                "pos": vec_str(target_pose[:3]),
+                "size": "0.015",
+                "rgba": "0 1 0 0.5",
+            },
+        )
+
+        for section_name in ["contact", "tendon", "actuator"]:
+            section = hand_root.find(section_name)
+            if section is not None:
+                root.append(copy.deepcopy(section))
+
+        ET.ElementTree(root).write(xml_path, encoding="utf-8", xml_declaration=True)
+        return xml_path
+
+    def _apply_hand_collision_filter(self, body: ET.Element) -> None:
+        if self.config.get("collision_filter", "object_hand_table") == "default":
+            return
+        for geom in body.iter("geom"):
+            geom_class = str(geom.get("class", ""))
+            if "visual" in geom_class or geom.get("contype") == "0":
+                geom.set("contype", "0")
+                geom.set("conaffinity", "0")
+            else:
+                geom.set("contype", "1")
+                geom.set("conaffinity", "2")
+
+    def _target_object_pose_from_entries(self) -> np.ndarray:
+        if self.config.get("target_object_pose_wxyz") is not None:
+            return as_vec(self.config["target_object_pose_wxyz"], 7, "target_object_pose_wxyz")
+        pose = as_vec(
+            self.target_entry.get("object_scene_pose_wxyz", self.target_entry["object_pose_world_wxyz"]),
+            7,
+            "target object pose",
+        ).copy()
+        if self.config.get("target_relative_axis") is not None:
+            axis = as_vec(self.config.get("target_relative_axis"), 3, "target_relative_axis")
+            angle = float(self.config.get("target_relative_angle", 0.0))
+            pose[3:7] = quat_mul(axis_angle_quat(axis, angle), pose[3:7])
+        return pose
+
+    def _cache_ids(self):
+        self.hand_qpos_addr = np.asarray([self._joint_qpos_addr(name) for name in REFINE_JOINT_NAMES], dtype=np.int32)
+        self.hand_qvel_addr = np.asarray([self.model.jnt_dofadr[mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)] for name in REFINE_JOINT_NAMES], dtype=np.int32)
+        self.object_joint_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "object_freejoint")
+        self.object_qpos_addr = int(self.model.jnt_qposadr[self.object_joint_id])
+        self.object_qvel_addr = int(self.model.jnt_dofadr[self.object_joint_id])
+        self.object_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "Object")
+        self.fixed_hand_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "fixed_hand_base")
+        self.object_geom_ids = self._descendant_geom_ids(self.object_body_id)
+        self.hand_geom_ids = self._descendant_geom_ids(self.fixed_hand_body_id)
+        self.actuator_ids = [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name) for name in ACTUATOR_NAMES]
+
+    def _descendant_geom_ids(self, root_body_id: int) -> set:
+        geom_ids = set()
+        for geom_id in range(self.model.ngeom):
+            body_id = int(self.model.geom_bodyid[geom_id])
+            while body_id >= 0:
+                if body_id == root_body_id:
+                    geom_ids.add(geom_id)
+                    break
+                parent_id = int(self.model.body_parentid[body_id])
+                if parent_id == body_id:
+                    break
+                body_id = parent_id
+        return geom_ids
+
+    def _joint_qpos_addr(self, name: str) -> int:
+        joint_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
+        if joint_id < 0:
+            raise KeyError(f"Missing joint in model: {name}")
+        return int(self.model.jnt_qposadr[joint_id])
+
+    def _object_pose(self) -> np.ndarray:
+        return self.data.qpos[self.object_qpos_addr : self.object_qpos_addr + 7].copy()
+
+    def _object_vel(self) -> np.ndarray:
+        return self.data.qvel[self.object_qvel_addr : self.object_qvel_addr + 6].copy()
+
+    def _get_obs(self) -> np.ndarray:
+        hand_qpos = self.data.qpos[self.hand_qpos_addr].copy()
+        hand_qvel = self.data.qvel[self.hand_qvel_addr].copy()
+        object_pose = self._object_pose()
+        object_vel = self._object_vel()
+        pos_err = object_pose[:3] - self.target_object_pose[:3]
+        rot_err = np.asarray([quat_error_angle(object_pose[3:7], self.target_object_pose[3:7])], dtype=np.float64)
+        hand_err = hand_qpos - self.target_hand_qpos
+        contact_count = np.asarray([float(self._object_hand_contact_count())], dtype=np.float64)
+        return np.concatenate(
+            [
+                hand_qpos,
+                hand_qvel,
+                object_pose,
+                object_vel,
+                self.target_object_pose,
+                pos_err,
+                rot_err,
+                hand_err,
+                contact_count,
+            ]
+        ).astype(np.float32)
+
+    def _initial_ctrl_from_qpos(self, hand_qpos: np.ndarray) -> np.ndarray:
+        qpos_backup = self.data.qpos.copy()
+        qvel_backup = self.data.qvel.copy()
+        self.data.qpos[:] = qpos_backup
+        self.data.qpos[self.hand_qpos_addr] = as_vec(hand_qpos, len(REFINE_JOINT_NAMES), "hand_qpos")
+        self.data.qvel[:] = 0.0
+        mujoco.mj_forward(self.model, self.data)
+
+        ctrl = np.zeros(self.model.nu, dtype=np.float64)
+        for actuator_id in range(self.model.nu):
+            trn_type = int(self.model.actuator_trntype[actuator_id])
+            trn_id = int(self.model.actuator_trnid[actuator_id, 0])
+            if trn_type == int(mujoco.mjtTrn.mjTRN_JOINT):
+                qpos_addr = int(self.model.jnt_qposadr[trn_id])
+                ctrl[actuator_id] = self.data.qpos[qpos_addr]
+            elif trn_type == int(mujoco.mjtTrn.mjTRN_TENDON):
+                ctrl[actuator_id] = self.data.ten_length[trn_id]
+            else:
+                name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_id)
+                raise ValueError(f"Unsupported actuator transmission for {name}: {trn_type}")
+
+        self.data.qpos[:] = qpos_backup
+        self.data.qvel[:] = qvel_backup
+        mujoco.mj_forward(self.model, self.data)
+        return self._clip_ctrl(ctrl)
+
+    def _clip_ctrl(self, ctrl: np.ndarray) -> np.ndarray:
+        ctrl = np.asarray(ctrl, dtype=np.float64).copy()
+        ctrl[self.ctrl_limited] = np.clip(
+            ctrl[self.ctrl_limited],
+            self.ctrl_low[self.ctrl_limited],
+            self.ctrl_high[self.ctrl_limited],
+        )
+        return ctrl
+
+    def reset(self, *, seed=None, options=None):
+        if seed is not None:
+            self.seed(seed)
+        mujoco.mj_resetData(self.model, self.data)
+        self.step_count = 0
+        self.data.qpos[self.hand_qpos_addr] = self.init_hand_qpos
+        self.data.qpos[self.object_qpos_addr : self.object_qpos_addr + 7] = self.init_object_pose
+        self.data.qvel[:] = 0.0
+        self.data.ctrl[:] = self.default_ctrl
+        mujoco.mj_forward(self.model, self.data)
+        return self._get_obs(), self._info()
+
+    def step(self, action):
+        action = np.asarray(action, dtype=np.float64).reshape(-1)
+        action = np.clip(action, -1.0, 1.0)
+        if self.action_mode == "absolute":
+            ctrl = self.default_ctrl + self.action_scale * action
+            ctrl[self.ctrl_limited] = (
+                self.ctrl_low[self.ctrl_limited]
+                + 0.5
+                * (action[self.ctrl_limited] + 1.0)
+                * (self.ctrl_high[self.ctrl_limited] - self.ctrl_low[self.ctrl_limited])
+            )
+        elif self.action_mode == "delta":
+            ctrl = self.default_ctrl + self.action_scale * action
+        else:
+            raise ValueError("action_mode must be 'delta' or 'absolute'")
+        ctrl = self._clip_ctrl(ctrl)
+        self.data.ctrl[:] = ctrl
+        for _ in range(self.frame_skip):
+            mujoco.mj_step(self.model, self.data)
+        self.step_count += 1
+
+        obs = self._get_obs()
+        info = self._info()
+        terminated = bool(info["dropped"] and self.config.get("done_on_drop", True))
+        truncated = self.step_count >= self.horizon
+        return obs, float(info["reward"]), terminated, truncated, info
+
+    def _info(self) -> Dict[str, Any]:
+        object_pose = self._object_pose()
+        hand_qpos = self.data.qpos[self.hand_qpos_addr].copy()
+        pos_err = float(np.linalg.norm(object_pose[:3] - self.target_object_pose[:3]))
+        rot_err = float(quat_error_angle(object_pose[3:7], self.target_object_pose[3:7]))
+        hand_err = float(np.linalg.norm(hand_qpos - self.target_hand_qpos) / math.sqrt(len(hand_qpos)))
+        contacts = self._object_hand_contact_count()
+        dropped = self._dropped(object_pose)
+        reward = self._reward(pos_err, rot_err, hand_err, contacts, dropped)
+        solved = (
+            pos_err < float(self.config.get("success_pos_threshold", 0.03))
+            and rot_err < float(self.config.get("success_rot_threshold", 0.35))
+            and not dropped
+        )
+        return {
+            "reward": reward,
+            "pos_err": pos_err,
+            "rot_err": rot_err,
+            "hand_err": hand_err,
+            "contact_count": contacts,
+            "dropped": dropped,
+            "solved": solved,
+            "fixed_base_pose_wxyz": self.initial_entry["refine_hand_pose_world_wxyz"],
+            "object_name": self.initial_entry.get("object_name", ""),
+            "model_xml_path": str(self.model_xml_path),
+        }
+
+    def _reward(self, pos_err, rot_err, hand_err, contacts, dropped) -> float:
+        reward = 0.0
+        reward -= float(self.config.get("pos_weight", 10.0)) * pos_err
+        reward -= float(self.config.get("rot_weight", 1.0)) * rot_err
+        reward -= float(self.config.get("hand_weight", 0.05)) * hand_err
+        reward += float(self.config.get("contact_bonus", 0.02)) * min(contacts, 5)
+        if dropped:
+            reward -= float(self.config.get("drop_penalty", 10.0))
+        return float(reward)
+
+    def _object_hand_contact_count(self) -> int:
+        count = 0
+        for i in range(self.data.ncon):
+            contact = self.data.contact[i]
+            geom1 = int(contact.geom1)
+            geom2 = int(contact.geom2)
+            if (geom1 in self.object_geom_ids and geom2 in self.hand_geom_ids) or (
+                geom2 in self.object_geom_ids and geom1 in self.hand_geom_ids
+            ):
+                count += 1
+        return count
+
+    def _dropped(self, object_pose) -> bool:
+        axis = str(self.initial_entry.get("table_axis", "xz"))
+        up_index = 1 if axis == "xz" else 2
+        table_pose = as_vec(self.initial_entry.get("table_pose_wxyz", [0, 0, 0, 1, 0, 0, 0]), 7, "table_pose")
+        return bool(object_pose[up_index] < table_pose[up_index] - float(self.config.get("drop_margin", 0.03)))
+
+    def set_gravity_vector(self, gravity_vector, gravity_scale=None):
+        self._base_gravity = as_vec(gravity_vector, 3, "gravity_vector")
+        if gravity_scale is not None:
+            self._gravity_scale = float(gravity_scale)
+        self.set_gravity_scale(getattr(self, "_gravity_scale", 1.0))
+
+    def set_gravity_scale(self, gravity_scale):
+        self._gravity_scale = float(gravity_scale)
+        self.model.opt.gravity[:] = self._base_gravity * self._gravity_scale
+        return self._gravity_scale
+
+    def render(self):
+        if self.viewer is None:
+            self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
+        self.viewer.sync()
+
+    def mj_render(self):
+        return self.render()
+
+    def close(self):
+        if self.viewer is not None:
+            self.viewer.close()
+            self.viewer = None
+
+
+def make_refine_tabletop_env(config: Dict[str, Any], seed: Optional[int] = None) -> RefineTabletopEnv:
+    return RefineTabletopEnv(config=config, seed=seed)

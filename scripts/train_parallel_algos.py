@@ -9,9 +9,17 @@ import numpy as np
 import robohive
 from robohive.utils import gym as rhgym
 from stable_baselines3 import A2C, DDPG, PPO, SAC, TD3
-from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback, EvalCallback
+from stable_baselines3.common.callbacks import (
+    BaseCallback,
+    CallbackList,
+    CheckpointCallback,
+    EvalCallback,
+)
 from stable_baselines3.common.noise import NormalActionNoise, OrnsteinUhlenbeckActionNoise
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
+
+from refine_grasp_reset_wrapper import RefineGraspResetWrapper
+from refine_tabletop_env import make_refine_tabletop_env
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +28,40 @@ DEFAULT_CONFIG = Path(__file__).resolve().parent / "config" / "relocate" / "trai
 
 class RoboHiveSB3Compat(gymnasium.Wrapper):
     """Convert RoboHive/Gym-style outputs to Gymnasium outputs for SB3 2.x."""
+
+    def __init__(self, env, gravity_vector=None, gravity_scale=1.0):
+        super().__init__(env)
+        self._base_gravity = self._read_gravity(gravity_vector)
+        self._gravity_scale = float(gravity_scale)
+        self.set_gravity_scale(self._gravity_scale)
+
+    def _read_gravity(self, gravity_vector=None):
+        if gravity_vector is not None:
+            gravity = np.asarray(gravity_vector, dtype=np.float64)
+        else:
+            gravity = np.asarray(self._mujoco_model().opt.gravity, dtype=np.float64)
+        if gravity.shape != (3,):
+            raise ValueError(f"gravity_vector must have shape (3,), got {gravity.shape}")
+        return gravity
+
+    def _mujoco_model(self):
+        env = self.env.unwrapped
+        if hasattr(env, "sim"):
+            return env.sim.model
+        if hasattr(env, "model"):
+            return env.model
+        raise AttributeError("Wrapped env does not expose sim.model or model")
+
+    def set_gravity_vector(self, gravity_vector, gravity_scale=None):
+        self._base_gravity = self._read_gravity(gravity_vector)
+        if gravity_scale is not None:
+            self._gravity_scale = float(gravity_scale)
+        self.set_gravity_scale(self._gravity_scale)
+
+    def set_gravity_scale(self, gravity_scale):
+        self._gravity_scale = float(gravity_scale)
+        self._mujoco_model().opt.gravity[:] = self._base_gravity * self._gravity_scale
+        return self._gravity_scale
 
     def reset(self, *, seed=None, options=None):
         if seed is not None:
@@ -60,17 +102,44 @@ def load_config(path):
         return json.load(f)
 
 
-def make_single_env(env_id, seed):
-    raw_env = rhgym.make(env_id, seed=seed, disable_env_checker=True)
-    return RoboHiveSB3Compat(raw_env)
+def make_single_env(
+    env_id,
+    seed,
+    gravity_vector=None,
+    gravity_scale=1.0,
+    refine_grasp_reset=None,
+    refine_tabletop=None,
+):
+    if env_id == "refine-tabletop-v1":
+        raw_env = make_refine_tabletop_env(refine_tabletop or {}, seed=seed)
+    else:
+        raw_env = rhgym.make(env_id, seed=seed, disable_env_checker=True)
+    if refine_grasp_reset and refine_grasp_reset.get("enabled", False):
+        raw_env = RefineGraspResetWrapper(raw_env, refine_grasp_reset, seed=seed)
+    return RoboHiveSB3Compat(
+        raw_env,
+        gravity_vector=gravity_vector,
+        gravity_scale=gravity_scale,
+    )
 
 
 def make_env_fn(config, rank):
     env_id = config["env_id"]
     seed = int(config.get("seed", 0)) + rank
+    gravity_vector = config.get("gravity_vector", None)
+    gravity_scale = float(config.get("gravity_scale", 1.0))
+    refine_grasp_reset = config.get("refine_grasp_reset", None)
+    refine_tabletop = config.get("refine_tabletop", None)
 
     def _init():
-        return make_single_env(env_id, seed)
+        return make_single_env(
+            env_id,
+            seed,
+            gravity_vector=gravity_vector,
+            gravity_scale=gravity_scale,
+            refine_grasp_reset=refine_grasp_reset,
+            refine_tabletop=refine_tabletop,
+        )
 
     return _init
 
@@ -97,8 +166,25 @@ def build_train_env(config, run_dir):
 
 def build_eval_env(config):
     eval_seed = int(config.get("seed", 0)) + 100000
+    gravity_vector = config.get("eval_gravity_vector", config.get("gravity_vector", None))
+    gravity_scale = float(config.get("eval_gravity_scale", config.get("gravity_scale", 1.0)))
+    refine_grasp_reset = config.get(
+        "eval_refine_grasp_reset", config.get("refine_grasp_reset", None)
+    )
+    refine_tabletop = config.get("eval_refine_tabletop", config.get("refine_tabletop", None))
     return VecMonitor(
-        DummyVecEnv([lambda: make_single_env(config["env_id"], eval_seed)]),
+        DummyVecEnv(
+            [
+                lambda: make_single_env(
+                    config["env_id"],
+                    eval_seed,
+                    gravity_vector=gravity_vector,
+                    gravity_scale=gravity_scale,
+                    refine_grasp_reset=refine_grasp_reset,
+                    refine_tabletop=refine_tabletop,
+                )
+            ]
+        ),
         info_keywords=tuple(config.get("info_keywords", ["solved"])),
     )
 
@@ -109,8 +195,61 @@ def scale_freq(freq, n_envs):
     return max(int(freq) // max(n_envs, 1), 1)
 
 
+class GravityCurriculumCallback(BaseCallback):
+    """Linearly increase MuJoCo gravity scale through VecEnv env_method calls."""
+
+    def __init__(
+        self,
+        start_scale,
+        end_scale,
+        duration_timesteps,
+        start_timestep=0,
+        verbose=0,
+    ):
+        super().__init__(verbose=verbose)
+        self.start_scale = float(start_scale)
+        self.end_scale = float(end_scale)
+        self.duration_timesteps = max(int(duration_timesteps), 1)
+        self.start_timestep = max(int(start_timestep), 0)
+        self._last_scale = None
+
+    def _compute_scale(self):
+        if self.num_timesteps <= self.start_timestep:
+            return self.start_scale
+        progress = (self.num_timesteps - self.start_timestep) / self.duration_timesteps
+        progress = float(np.clip(progress, 0.0, 1.0))
+        return self.start_scale + progress * (self.end_scale - self.start_scale)
+
+    def _set_scale(self, scale):
+        if self._last_scale is not None and abs(scale - self._last_scale) < 1e-6:
+            return
+        self.training_env.env_method("set_gravity_scale", scale)
+        self._last_scale = scale
+
+    def _on_training_start(self):
+        self._set_scale(self._compute_scale())
+
+    def _on_step(self):
+        self._set_scale(self._compute_scale())
+        return True
+
+
 def build_callbacks(config, run_dir, n_envs):
     callbacks = []
+
+    gravity_cfg = config.get("gravity_curriculum", {})
+    if gravity_cfg.get("enabled", False):
+        callbacks.append(
+            GravityCurriculumCallback(
+                start_scale=gravity_cfg.get("start_scale", 0.0),
+                end_scale=gravity_cfg.get("end_scale", 1.0),
+                duration_timesteps=gravity_cfg.get(
+                    "duration_timesteps", config.get("total_timesteps", 100000)
+                ),
+                start_timestep=gravity_cfg.get("start_timestep", 0),
+                verbose=int(config.get("verbose", 1)),
+            )
+        )
 
     checkpoint_freq = scale_freq(config.get("checkpoint_freq", 0), n_envs)
     if checkpoint_freq:
@@ -237,6 +376,11 @@ def train(config):
     print(f"vec_env={config.get('vec_env', 'subproc')}")
     print(f"device={config.get('device', 'cuda')}")
     print(f"total_timesteps={int(config.get('total_timesteps', 100000))}")
+    print(f"gravity_vector={config.get('gravity_vector', 'env_default')}")
+    print(f"gravity_scale={float(config.get('gravity_scale', 1.0))}")
+    print(f"gravity_curriculum={config.get('gravity_curriculum', {})}")
+    print(f"refine_grasp_reset={config.get('refine_grasp_reset', {})}")
+    print(f"refine_tabletop={config.get('refine_tabletop', {})}")
     print(f"checkpoint_freq={int(config.get('checkpoint_freq', 0))}")
     print(f"eval_freq={int(config.get('eval_freq', 0))}")
     print(f"algo_kwargs={algo_kwargs}")
