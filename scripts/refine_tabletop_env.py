@@ -65,6 +65,7 @@ ACTUATOR_NAMES = [
     "rh_A_LFJ0",
 ]
 
+
 def resolve_project_path(path: Optional[str]) -> Optional[Path]:
     if path is None or str(path) == "":
         return None
@@ -140,6 +141,11 @@ def xml_children(parent, tag):
     return list(child) if child is not None else []
 
 
+def first_scalar(value, default: float) -> float:
+    arr = np.asarray(value if value is not None else default, dtype=np.float64).reshape(-1)
+    return float(arr[0]) if arr.size else float(default)
+
+
 class RefineTabletopEnv(gymnasium.Env):
     """Fixed-base ShadowHand tabletop env built from Grasp_Refine assets."""
 
@@ -153,6 +159,18 @@ class RefineTabletopEnv(gymnasium.Env):
         self.horizon = int(self.config.get("horizon", 200))
         self.step_count = 0
         self.viewer = None
+        self.sample_mode = str(self.config.get("sample_mode", "fixed")).lower()
+        if self.sample_mode not in {"fixed", "random_env", "random_reset"}:
+            raise ValueError("sample_mode must be one of: fixed, random_env, random_reset")
+        self.target_sample_mode = str(self.config.get("target_sample_mode", "same_initial")).lower()
+        if self.target_sample_mode not in {"same_initial", "random_same_object"}:
+            raise ValueError("target_sample_mode must be one of: same_initial, random_same_object")
+        self._base_gravity = as_vec(
+            self.config.get("gravity_vector", [0.0, -9.81, 0.0]),
+            3,
+            "gravity_vector",
+        )
+        self._gravity_scale = float(self.config.get("gravity_scale", 1.0))
 
         manifest_path = resolve_project_path(self.config.get("manifest_path"))
         if manifest_path is None:
@@ -161,24 +179,98 @@ class RefineTabletopEnv(gymnasium.Env):
         self.entries = list(self.manifest.get("entries", []))
         if not self.entries:
             raise ValueError(f"No entries in manifest: {manifest_path}")
+        self.entry_indices = self._eligible_entry_indices()
+        self.entries_by_object = self._group_entries_by_object()
 
-        self.initial_index = int(self.config.get("initial_grasp_index", 0))
+        self.hand_xml = resolve_project_path(self.config.get("hand_xml")) or DEFAULT_HAND_XML
+        self.action_mode = str(self.config.get("action_mode", "delta")).lower()
+        self.action_scale = float(self.config.get("action_scale", 0.15))
+        self._select_entries(initial=True)
+        self._load_model_for_current_entries()
+        obs = self._get_obs()
+        self.observation_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=obs.shape,
+            dtype=np.float32,
+        )
+
+    def seed(self, seed=None):
+        if seed is not None:
+            self.rng.seed(seed)
+        return [seed]
+
+    @property
+    def unwrapped(self):
+        return self
+
+    def _eligible_entry_indices(self):
+        object_names = self.config.get("object_names", None)
+        if object_names is None and self.config.get("object_name", None) is not None:
+            object_names = [self.config["object_name"]]
+        object_names = set(object_names or [])
+        indices = []
+        for index, entry in enumerate(self.entries):
+            if object_names and entry.get("object_name") not in object_names:
+                continue
+            indices.append(index)
+        if not indices:
+            raise ValueError("No manifest entries matched object_name/object_names filter")
+        return indices
+
+    def _group_entries_by_object(self):
+        groups = {}
+        for index in self.entry_indices:
+            groups.setdefault(self.entries[index].get("object_name", ""), []).append(index)
+        return groups
+
+    def _select_entries(self, initial=False):
+        if self.sample_mode == "fixed" or (initial and self.sample_mode == "random_reset"):
+            initial_index = int(self.config.get("initial_grasp_index", self.entry_indices[0]))
+        else:
+            initial_index = int(self.rng.choice(self.entry_indices))
+
+        if initial_index not in self.entry_indices:
+            raise ValueError(f"initial_grasp_index={initial_index} is not in the eligible entry set")
+
+        self.initial_index = initial_index
         self.initial_entry = self.entries[self.initial_index]
-        self.target_entry = self._resolve_target_entry()
+        self.target_index = self._resolve_target_index()
+        self.target_entry = self.entries[self.target_index]
         if self.target_entry.get("object_name") != self.initial_entry.get("object_name"):
             raise ValueError("initial_grasp_index and target_grasp_index must use the same object_name")
 
-        self.hand_xml = resolve_project_path(self.config.get("hand_xml")) or DEFAULT_HAND_XML
+    def _resolve_target_index(self) -> int:
+        target_index = self.config.get("target_grasp_index", None)
+        if target_index is not None and self.sample_mode == "fixed":
+            return int(target_index)
+        if self.target_sample_mode == "random_same_object":
+            candidates = self.entries_by_object.get(self.initial_entry.get("object_name", ""), [])
+            return int(self.rng.choice(candidates)) if candidates else self.initial_index
+        return self.initial_index
+
+    def _load_model_for_current_entries(self):
+        if self.viewer is not None:
+            self.viewer.close()
+            self.viewer = None
+
         self.model_xml_path = self._build_model_xml()
         self.model = mujoco.MjModel.from_xml_path(str(self.model_xml_path))
         self.data = mujoco.MjData(self.model)
         self._cache_ids()
 
+        self.fixed_base_pose = self._pose_with_lift(
+            as_vec(self.initial_entry["refine_hand_pose_world_wxyz"], 7, "hand pose"),
+            self.initial_entry,
+        )
         self.init_hand_qpos = as_vec(self.initial_entry["refine_finger_qpos22"], 22, "init hand qpos")
-        self.init_object_pose = as_vec(
-            self.initial_entry.get("object_scene_pose_wxyz", self.initial_entry["object_pose_world_wxyz"]),
-            7,
-            "init object pose",
+        self.init_object_pose = self._pose_with_lift(
+            as_vec(
+                self.initial_entry.get("object_scene_pose_wxyz", self.initial_entry["object_pose_world_wxyz"]),
+                7,
+                "init object pose",
+            ),
+            self.initial_entry,
         )
         self.target_hand_qpos = as_vec(
             self.target_entry.get("refine_finger_qpos22", self.initial_entry["refine_finger_qpos22"]),
@@ -191,54 +283,57 @@ class RefineTabletopEnv(gymnasium.Env):
         self.ctrl_high = self.model.actuator_ctrlrange[:, 1].astype(np.float64)
         self.ctrl_limited = np.asarray(self.model.actuator_ctrllimited, dtype=bool)
         self.default_ctrl = self._initial_ctrl_from_qpos(self.init_hand_qpos)
-        self.action_mode = str(self.config.get("action_mode", "delta")).lower()
-        self.action_scale = float(self.config.get("action_scale", 0.15))
         self.action_space = spaces.Box(-1.0, 1.0, shape=(self.model.nu,), dtype=np.float32)
-        obs = self._get_obs()
-        self.observation_space = spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=obs.shape,
-            dtype=np.float32,
-        )
-
-        self.set_gravity_vector(
-            self.config.get("gravity_vector", [0.0, -9.81, 0.0]),
-            gravity_scale=float(self.config.get("gravity_scale", 1.0)),
-        )
-
-    def seed(self, seed=None):
-        if seed is not None:
-            self.rng.seed(seed)
-        return [seed]
-
-    @property
-    def unwrapped(self):
-        return self
-
-    def _resolve_target_entry(self) -> Dict[str, Any]:
-        target_index = self.config.get("target_grasp_index", None)
-        if target_index is None:
-            return self.initial_entry
-        return self.entries[int(target_index)]
+        self.model.opt.gravity[:] = self._base_gravity * self._gravity_scale
 
     def _target_object_pose(self) -> np.ndarray:
         if self.config.get("target_object_pose_wxyz") is not None:
             return as_vec(self.config["target_object_pose_wxyz"], 7, "target_object_pose_wxyz")
-        pose = as_vec(
-            self.target_entry.get("object_scene_pose_wxyz", self.target_entry["object_pose_world_wxyz"]),
-            7,
-            "target object pose",
-        ).copy()
+        pose = self._pose_with_lift(
+            as_vec(
+                self.target_entry.get("object_scene_pose_wxyz", self.target_entry["object_pose_world_wxyz"]),
+                7,
+                "target object pose",
+            ),
+            self.initial_entry,
+        )
         if self.config.get("target_relative_axis") is not None:
             axis = as_vec(self.config.get("target_relative_axis"), 3, "target_relative_axis")
             angle = float(self.config.get("target_relative_angle", 0.0))
             pose[3:7] = quat_mul(axis_angle_quat(axis, angle), pose[3:7])
         return pose
 
+    def _table_up_vector(self, entry: Optional[Dict[str, Any]] = None) -> np.ndarray:
+        if self.config.get("lift_direction") is not None:
+            direction = as_vec(self.config["lift_direction"], 3, "lift_direction")
+            norm = np.linalg.norm(direction)
+            if norm < 1e-8:
+                raise ValueError("lift_direction must be non-zero")
+            return direction / norm
+        entry = entry or self.initial_entry
+        axis = str(entry.get("table_axis", "xz")).lower()
+        if axis == "xz":
+            return np.asarray([0.0, 1.0, 0.0], dtype=np.float64)
+        if axis == "xy":
+            return np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
+        if axis == "yz":
+            return np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
+        raise ValueError(f"Unsupported table_axis for lift: {axis}")
+
+    def _lift_offset(self, entry: Optional[Dict[str, Any]] = None) -> np.ndarray:
+        distance = float(self.config.get("lift_distance", self.config.get("lift_after_grasp_distance", 0.0)))
+        return self._table_up_vector(entry) * distance
+
+    def _pose_with_lift(self, pose, entry: Optional[Dict[str, Any]] = None) -> np.ndarray:
+        pose = as_vec(pose, 7, "pose").copy()
+        pose[:3] += self._lift_offset(entry)
+        return pose
+
     def _build_model_xml(self) -> Path:
         model_dir = resolve_project_path(self.config.get("model_dir")) or DEFAULT_MODEL_DIR
         model_dir.mkdir(parents=True, exist_ok=True)
+        friction = self._friction()
+        object_density = self._object_density_from_config()
         xml_key = json.dumps(
             {
                 "object": self.initial_entry.get("object_name"),
@@ -247,7 +342,21 @@ class RefineTabletopEnv(gymnasium.Env):
                 "hand_pose": self.initial_entry.get("refine_hand_pose_world_wxyz"),
                 "hand_xml": str(self.hand_xml),
                 "collision_filter": self.config.get("collision_filter", "object_hand_table"),
-                "schema": 2,
+                "initial_index": self.initial_index,
+                "target_index": self.target_index,
+                "lift_distance": float(self.config.get("lift_distance", self.config.get("lift_after_grasp_distance", 0.0))),
+                "lift_direction": self.config.get("lift_direction", None),
+                "target_pose": self._target_object_pose_from_entries().round(9).tolist(),
+                "integrator": self.config.get("integrator", "implicitfast"),
+                "timestep": float(self.config.get("timestep", 0.004)),
+                "noslip_iterations": int(self.config.get("noslip_iterations", 2)),
+                "impratio": float(self.config.get("impratio", 10.0)),
+                "friction": friction.round(9).tolist(),
+                "object_density": round(float(object_density), 9),
+                "object_margin": float(self.config.get("object_margin", 0.001)),
+                "hand_margin": float(self.config.get("hand_margin", 0.001)),
+                "plane_margin": float(self.config.get("plane_margin", 0.002)),
+                "schema": 4,
             },
             sort_keys=True,
         )
@@ -271,9 +380,11 @@ class RefineTabletopEnv(gymnasium.Env):
             root,
             "option",
             {
-                "timestep": str(float(self.config.get("timestep", 0.002))),
+                "timestep": str(float(self.config.get("timestep", 0.004))),
+                "integrator": str(self.config.get("integrator", "implicitfast")),
                 "cone": "elliptic",
-                "impratio": "10",
+                "impratio": str(float(self.config.get("impratio", 10.0))),
+                "noslip_iterations": str(int(self.config.get("noslip_iterations", 2))),
                 "gravity": vec_str(self.config.get("gravity_vector", [0.0, -9.81, 0.0])),
             },
         )
@@ -316,13 +427,18 @@ class RefineTabletopEnv(gymnasium.Env):
                 "pos": vec_str(table_pose[:3]),
                 "quat": vec_str(table_pose[3:7]),
                 "size": vec_str(table_size),
-                "friction": "1 0.5 0.01",
+                "friction": vec_str(friction),
+                "condim": "4",
+                "margin": str(float(self.config.get("plane_margin", 0.002))),
                 "contype": "4",
                 "conaffinity": "2",
             },
         )
 
-        hand_pose = as_vec(self.initial_entry["refine_hand_pose_world_wxyz"], 7, "hand pose")
+        hand_pose = self._pose_with_lift(
+            as_vec(self.initial_entry["refine_hand_pose_world_wxyz"], 7, "hand pose"),
+            self.initial_entry,
+        )
         fixed_hand = ET.SubElement(
             worldbody,
             "body",
@@ -337,10 +453,13 @@ class RefineTabletopEnv(gymnasium.Env):
             self._apply_hand_collision_filter(hand_child)
             fixed_hand.append(hand_child)
 
-        object_pose = as_vec(
-            self.initial_entry.get("object_scene_pose_wxyz", self.initial_entry["object_pose_world_wxyz"]),
-            7,
-            "object pose",
+        object_pose = self._pose_with_lift(
+            as_vec(
+                self.initial_entry.get("object_scene_pose_wxyz", self.initial_entry["object_pose_world_wxyz"]),
+                7,
+                "object pose",
+            ),
+            self.initial_entry,
         )
         object_body = ET.SubElement(
             worldbody,
@@ -348,7 +467,7 @@ class RefineTabletopEnv(gymnasium.Env):
             {"name": "Object", "pos": vec_str(object_pose[:3]), "quat": vec_str(object_pose[3:7])},
         )
         ET.SubElement(object_body, "freejoint", {"name": "object_freejoint"})
-        density = str(float(self.config.get("object_density", 1000.0)))
+        density = str(float(object_density))
         for geom in object_root.findall("./worldbody/body/geom"):
             geom_copy = copy.deepcopy(geom)
             if geom_copy.get("name"):
@@ -358,8 +477,8 @@ class RefineTabletopEnv(gymnasium.Env):
             if geom_copy.get("contype", "1") != "0":
                 geom_copy.set("density", density)
                 geom_copy.set("condim", "4")
-                geom_copy.set("friction", "1 0.5 0.01")
-                geom_copy.set("margin", str(float(self.config.get("object_margin", 0.0))))
+                geom_copy.set("friction", vec_str(friction))
+                geom_copy.set("margin", str(float(self.config.get("object_margin", 0.001))))
                 geom_copy.set("contype", "2")
                 geom_copy.set("conaffinity", "5")
             object_body.append(geom_copy)
@@ -385,6 +504,31 @@ class RefineTabletopEnv(gymnasium.Env):
         ET.ElementTree(root).write(xml_path, encoding="utf-8", xml_declaration=True)
         return xml_path
 
+    def _friction(self) -> np.ndarray:
+        if self.config.get("friction") is not None:
+            return as_vec(self.config["friction"], 3, "friction")
+        miu_coef = as_vec(self.config.get("miu_coef", [0.6, 0.02]), 2, "miu_coef")
+        roll = float(self.config.get("friction_roll", 0.0001))
+        return np.asarray([miu_coef[0], miu_coef[1], roll], dtype=np.float64)
+
+    def _object_density_from_config(self) -> float:
+        if self.config.get("object_mass") is None:
+            return float(self.config.get("object_density", 1000.0))
+
+        obj_mass = float(self.config.get("object_mass"))
+        fallback_density = float(self.config.get("object_density", 1000.0))
+        info_path = self.initial_entry.get("object_info_path", None)
+        if not info_path or not Path(info_path).exists():
+            return fallback_density
+
+        info = load_json(Path(info_path))
+        info_scale = first_scalar(info.get("scale", 1.0), 1.0)
+        base_mass = first_scalar(info.get("mass", obj_mass), obj_mass)
+        base_density = first_scalar(info.get("density", fallback_density), fallback_density)
+        coef = base_mass / max(base_density * info_scale**3, 1e-12)
+        object_scale = as_vec(self.initial_entry.get("object_scale", [1.0, 1.0, 1.0]), 3, "object_scale")
+        return float(obj_mass / max(coef * float(np.prod(object_scale)), 1e-12))
+
     def _apply_hand_collision_filter(self, body: ET.Element) -> None:
         if self.config.get("collision_filter", "object_hand_table") == "default":
             return
@@ -396,15 +540,23 @@ class RefineTabletopEnv(gymnasium.Env):
             else:
                 geom.set("contype", "1")
                 geom.set("conaffinity", "2")
+                geom.set("condim", "4")
+                geom.set("friction", vec_str(self._friction()))
+                geom.set("margin", str(float(self.config.get("hand_margin", 0.001))))
+                geom.set("solimp", "0.5 0.99 0.0001")
+                geom.set("solref", "0.005 1")
 
     def _target_object_pose_from_entries(self) -> np.ndarray:
         if self.config.get("target_object_pose_wxyz") is not None:
             return as_vec(self.config["target_object_pose_wxyz"], 7, "target_object_pose_wxyz")
-        pose = as_vec(
-            self.target_entry.get("object_scene_pose_wxyz", self.target_entry["object_pose_world_wxyz"]),
-            7,
-            "target object pose",
-        ).copy()
+        pose = self._pose_with_lift(
+            as_vec(
+                self.target_entry.get("object_scene_pose_wxyz", self.target_entry["object_pose_world_wxyz"]),
+                7,
+                "target object pose",
+            ),
+            self.initial_entry,
+        )
         if self.config.get("target_relative_axis") is not None:
             axis = as_vec(self.config.get("target_relative_axis"), 3, "target_relative_axis")
             angle = float(self.config.get("target_relative_angle", 0.0))
@@ -510,6 +662,9 @@ class RefineTabletopEnv(gymnasium.Env):
     def reset(self, *, seed=None, options=None):
         if seed is not None:
             self.seed(seed)
+        if self.sample_mode == "random_reset":
+            self._select_entries(initial=False)
+            self._load_model_for_current_entries()
         mujoco.mj_resetData(self.model, self.data)
         self.step_count = 0
         self.data.qpos[self.hand_qpos_addr] = self.init_hand_qpos
@@ -568,8 +723,13 @@ class RefineTabletopEnv(gymnasium.Env):
             "contact_count": contacts,
             "dropped": dropped,
             "solved": solved,
-            "fixed_base_pose_wxyz": self.initial_entry["refine_hand_pose_world_wxyz"],
+            "fixed_base_pose_wxyz": self.fixed_base_pose.tolist(),
+            "initial_grasp_index": self.initial_index,
+            "target_grasp_index": self.target_index,
+            "lift_offset": self._lift_offset(self.initial_entry).tolist(),
             "object_name": self.initial_entry.get("object_name", ""),
+            "object_density": float(self._object_density_from_config()),
+            "object_model_mass": float(self.model.body_subtreemass[self.object_body_id]),
             "model_xml_path": str(self.model_xml_path),
         }
 
@@ -598,8 +758,14 @@ class RefineTabletopEnv(gymnasium.Env):
     def _dropped(self, object_pose) -> bool:
         axis = str(self.initial_entry.get("table_axis", "xz"))
         up_index = 1 if axis == "xz" else 2
-        table_pose = as_vec(self.initial_entry.get("table_pose_wxyz", [0, 0, 0, 1, 0, 0, 0]), 7, "table_pose")
-        return bool(object_pose[up_index] < table_pose[up_index] - float(self.config.get("drop_margin", 0.03)))
+        drop_reference = str(self.config.get("drop_reference", "table")).lower()
+        if drop_reference == "initial":
+            reference_pose = self.init_object_pose
+        elif drop_reference == "table":
+            reference_pose = as_vec(self.initial_entry.get("table_pose_wxyz", [0, 0, 0, 1, 0, 0, 0]), 7, "table_pose")
+        else:
+            raise ValueError("drop_reference must be one of: table, initial")
+        return bool(object_pose[up_index] < reference_pose[up_index] - float(self.config.get("drop_margin", 0.03)))
 
     def set_gravity_vector(self, gravity_vector, gravity_scale=None):
         self._base_gravity = as_vec(gravity_vector, 3, "gravity_vector")

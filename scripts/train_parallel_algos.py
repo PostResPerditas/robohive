@@ -73,6 +73,8 @@ class RoboHiveSB3Compat(gymnasium.Wrapper):
         else:
             obs, info = out, {}
 
+        self.set_gravity_scale(self._gravity_scale)
+
         return np.asarray(obs, dtype=np.float32), info
 
     def step(self, action):

@@ -9,5 +9,5 @@
   "deterministic": true,
   "render": true,
   "sleep": 0.01,
-  "summary_csv": "runs/refine_tabletop_ppo_fixed_base_env4_seed0/visual_eval.csv"
+  "summary_csv": "runs/refine_tabletop_ppo_fixed_base_refinephys_lift8cm_env4_seed0/visual_eval.csv"
 }

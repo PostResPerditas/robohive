@@ -85,12 +85,12 @@ conda run -n refine python scripts/refine_grasp_dataset.py \
 
 使用 refine tabletop 稳定抓取状态作为 `relocate-v1` 初始状态，并逐步增加重力：
 
-conda run -n robohive python scripts/train_parallel_algos.py \
+python scripts/train_parallel_algos.py \
   --config scripts/config/refine/train_refine_relocate_sac_gravity_curriculum.json
 
 可视化训练出的模型：
 
-conda run -n robohive python scripts/visualize_algos.py \
+python scripts/visualize_algos.py \
   --config scripts/config/refine/visualize_refine_relocate_sac.json
 
 说明：当前 `RefineGraspResetWrapper` 是 RoboHive `relocate-v1` 的状态注入层，使用 refine 的稳定 grasp qpos 和 object pose，坐标默认采用 `[x, y, z]_refine -> [x, -z, y]_robohive`，将 refine tabletop 的 `+Y` 桌面法向对齐到 RoboHive 的 `+Z`。由于 `relocate-v1` 仍是内置 sphere 物体，而不是 refine 的真实 mesh，默认使用 `palm_object_offset_override` 把 RoboHive 的 `S_grasp` site 对齐到 sphere 附近，以保证初始手-物接触；真实物体 mesh 版本需要后续新增 MJCF/env。
@@ -112,27 +112,101 @@ python scripts/visualize_algos.py \
 
 关键点：
 
-- 手基座固定为 refine 抓取结果中的 `refine_hand_pose_world_wxyz`，不进入 qpos/action。
+- 手基座固定为 refine 抓取结果中的 `refine_hand_pose_world_wxyz`，不进入 qpos/action；如果配置 `lift_distance`，则 hand base 和 object 初始/目标位姿会沿桌面法向整体抬高。
 - hand qpos 为 22 维 Refine ShadowHand 手指关节，object qpos 为 7 维 freejoint，所以 `nq=29`。
 - action 为 18 维 ShadowHand actuator，使用 delta control，默认控制量由 joint/tendon transmission 从初始抓取 qpos 计算。
 - 物体 XML 来自 `/data/Project/Grasp_Refine/grasp_refine/assets/object/DGN_5k/processed_data/.../urdf/coacd.xml`，路径由 manifest 中的 `object_xml_path` 读取。
 - 默认碰撞过滤为 `object_hand_table`：手只和物体碰撞，物体和手/桌面碰撞，避免固定手基座场景下手-手自碰撞导致 reset 后数值发散。
+- 当前单物体配置使用 `lift_distance=0.08` 和 `drop_reference=initial`，即先把闭合抓取整体抬高 8cm，再在空中进行重定位；掉落判定相对抬高后的初始高度，而不是桌面高度。
+- 当前 tabletop env 已加入和 Refine `gravity_hold` 对齐的物理参数：`object_mass=0.1` 会通过 manifest 里的 `object_info_path/object_scale` 反算 MuJoCo density；`miu_coef=[0.6, 0.02]`、`object_margin=0.001`、`hand_margin=0.001`、`plane_margin=0.002`、`integrator=implicitfast`、`timestep=0.004`、`noslip_iterations=2`、`impratio=10.0`。
+- 注意：Refine 的 `gravity_hold` 会在每个仿真步持续 `set_ctrl(qpos)` 保持 hand base/手指目标；我们的 RL 环境 reset 后也会以初始闭合 qpos 作为 `default_ctrl`，但 policy 的 action 可能会让手指松开。判断 grasp 是否适合训练前，建议先做 zero-action hold 筛选。
 
 训练固定基座、真实物体 mesh 的 tabletop reorientation PPO：
 
 ```bash
-conda run -n robohive python scripts/train_parallel_algos.py \
+python scripts/train_parallel_algos.py \
   --config scripts/config/refine/train_refine_tabletop_ppo_fixed_base.json
 ```
 
 可视化训练后的 best model：
 
 ```bash
-conda run -n robohive python scripts/visualize_algos.py \
+python scripts/visualize_algos.py \
   --config scripts/config/refine/visualize_refine_tabletop_ppo_fixed_base.json
 ```
 
+多物体训练版本使用 `sample_mode=random_reset`：每个 episode 从 manifest 的稳定抓取条目中重新采样物体/抓取状态，并按对应 `object_xml_path` 重建真实 mesh 模型。训练命令：
+
+```bash
+python scripts/train_parallel_algos.py \
+  --config scripts/config/refine/train_refine_tabletop_ppo_fixed_base_multi_object.json
+```
+
+可视化多物体模型：
+
+```bash
+python scripts/visualize_algos.py \
+  --config scripts/config/refine/visualize_refine_tabletop_ppo_fixed_base_multi_object.json
+```
+
+查看训练结果：
+
+- `runs/refine_tabletop_ppo_fixed_base_multi_object_refinephys_lift8cm_env8_seed0/best_model/best_model.zip`：EvalCallback 保存的 best model。
+- `runs/refine_tabletop_ppo_fixed_base_multi_object_refinephys_lift8cm_env8_seed0/ppo_refine_tabletop_fixed_base_multi_object.zip`：训练结束保存的 final model。
+- `runs/refine_tabletop_ppo_fixed_base_multi_object_refinephys_lift8cm_env8_seed0/checkpoints/`：周期性 checkpoint。
+- `runs/refine_tabletop_ppo_fixed_base_multi_object_refinephys_lift8cm_env8_seed0/train_monitor.csv`：训练 episode 统计。
+- `runs/refine_tabletop_ppo_fixed_base_multi_object_refinephys_lift8cm_env8_seed0/eval/evaluations.npz`：周期性 eval 统计。
+- `runs/refine_tabletop_ppo_fixed_base_multi_object_refinephys_lift8cm_env8_seed0/tb/`：TensorBoard 日志。
+
+TensorBoard：
+
+```bash
+conda run -n robohive tensorboard \
+  --logdir runs/refine_tabletop_ppo_fixed_base_multi_object_refinephys_lift8cm_env8_seed0/tb \
+  --port 6006
+```
+
+无渲染批量评估，适合先看数值结果：
+
+```bash
+python scripts/visualize_algos.py \
+  --config scripts/config/refine/visualize_refine_tabletop_ppo_fixed_base_multi_object.json \
+  --no-render \
+  --episodes 50 \
+  --summary-csv runs/refine_tabletop_ppo_fixed_base_multi_object_refinephys_lift8cm_env8_seed0/visual_eval_50.csv
+```
+
+慢放随机多物体可视化：当前 `visualize_refine_tabletop_ppo_fixed_base_multi_object.json` 已设置 `sleep=0.05`、`reset_pause=1.5`、`episode_pause=2.0`、`step_log_interval=20`，每个 episode 会停顿并打印误差。
+
+固定看 manifest 第 0 个物体/抓取，不在不同物体之间切换：
+
+```bash
+python scripts/visualize_algos.py \
+  --config scripts/config/refine/visualize_refine_tabletop_ppo_fixed_base_multi_object_fixed0.json
+```
+
+如果想看其他固定样本，修改 `visualize_refine_tabletop_ppo_fixed_base_multi_object_fixed0.json` 里的 `eval_refine_tabletop.initial_grasp_index` 和 `target_grasp_index`。
+
+说明：如果使用单物体配置，`sample_mode=fixed` 且 `initial_grasp_index=0`，所以可视化只能看到一个物体；这不是可视化脚本限制，而是训练/环境配置只覆盖了一个物体。要学习多物体重定位，需要使用 `random_reset` 或者按物体分组训练多个模型。
+
 如果只想检查环境初始化和一步仿真，可以临时用 Python 直接构建 `RefineTabletopEnv`；期望现象是 `nq=29, nu=18`，reset 后有物体-手接触，零动作在 `gravity_scale=1.0` 下短时稳定。
+
+python scripts/visualize_algos.py \
+  --config scripts/config/refine/visualize_refine_tabletop_ppo_fixed_base_multi_object.json \
+  --episodes 120 \
+  --summary-csv runs/refine_tabletop_ppo_fixed_base_multi_object_refinephys_lift8cm_env8_seed0/visual_eval_check.csv \
+  --no-render \
+
+python scripts/visualize_algos.py \
+  --config scripts/config/refine/visualize_refine_tabletop_ppo_fixed_base_multi_object.json \
+  --episodes 10 \
+  --horizon 30
+
+
+"stop_on_done": false,
+"eval_refine_tabletop": {
+  "action_scale": 0.0
+}
 
 # Command
 

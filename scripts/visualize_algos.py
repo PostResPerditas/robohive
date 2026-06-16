@@ -21,6 +21,8 @@ Config fields accepted by this script:
     model_choice: "best", "final", or "path". Default: "best".
     device: "cuda", "cpu", or "auto".
     seed, episodes, horizon, sleep, deterministic.
+    reset_pause, episode_pause: seconds to keep rendering before/after each episode.
+    step_log_interval: print per-step info every N steps. 0 disables step logs.
     render: whether to call raw_env.unwrapped.mj_render().
     summary_csv: optional CSV path for episode-level results.
 """
@@ -57,6 +59,34 @@ ALGO_REGISTRY: Dict[str, Type[Any]] = {
 class RoboHiveSB3Compat(gymnasium.Wrapper):
     """Convert RoboHive/Gym reset-step outputs to Gymnasium-style outputs."""
 
+    def __init__(self, env, gravity_vector=None, gravity_scale=1.0):
+        super().__init__(env)
+        self._base_gravity = self._read_gravity(gravity_vector)
+        self._gravity_scale = float(gravity_scale)
+        self.set_gravity_scale(self._gravity_scale)
+
+    def _read_gravity(self, gravity_vector=None):
+        if gravity_vector is not None:
+            gravity = np.asarray(gravity_vector, dtype=np.float64)
+        else:
+            gravity = np.asarray(self._mujoco_model().opt.gravity, dtype=np.float64)
+        if gravity.shape != (3,):
+            raise ValueError(f"gravity_vector must have shape (3,), got {gravity.shape}")
+        return gravity
+
+    def _mujoco_model(self):
+        env = self.env.unwrapped
+        if hasattr(env, "sim"):
+            return env.sim.model
+        if hasattr(env, "model"):
+            return env.model
+        raise AttributeError("Wrapped env does not expose sim.model or model")
+
+    def set_gravity_scale(self, gravity_scale):
+        self._gravity_scale = float(gravity_scale)
+        self._mujoco_model().opt.gravity[:] = self._base_gravity * self._gravity_scale
+        return self._gravity_scale
+
     def reset(self, *, seed=None, options=None):
         if seed is not None:
             self.env.unwrapped.seed(seed)
@@ -66,6 +96,8 @@ class RoboHiveSB3Compat(gymnasium.Wrapper):
             obs, info = out
         else:
             obs, info = out, {}
+
+        self.set_gravity_scale(self._gravity_scale)
 
         return np.asarray(obs, dtype=np.float32), info
 
@@ -98,6 +130,15 @@ def load_json(path) -> Dict[str, Any]:
         return json.load(f)
 
 
+def deep_update(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            base[key] = deep_update(dict(base[key]), value)
+        else:
+            base[key] = value
+    return base
+
+
 def merge_config(config: Dict[str, Any], train_config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Merge visualization config over training config.
 
@@ -106,8 +147,8 @@ def merge_config(config: Dict[str, Any], train_config: Optional[Dict[str, Any]])
     """
     merged: Dict[str, Any] = {}
     if train_config:
-        merged.update(train_config)
-    merged.update({k: v for k, v in config.items() if v is not None})
+        deep_update(merged, train_config)
+    deep_update(merged, {k: v for k, v in config.items() if v is not None})
     return merged
 
 
@@ -193,15 +234,8 @@ def build_env(config: Dict[str, Any]) -> Tuple[RoboHiveSB3Compat, Any]:
         )
 
     gravity_vector = config.get("eval_gravity_vector", config.get("gravity_vector", None))
-    if gravity_vector is not None:
-        gravity_scale = float(config.get("eval_gravity_scale", config.get("gravity_scale", 1.0)))
-        base_env = raw_env.unwrapped
-        if hasattr(base_env, "sim"):
-            base_env.sim.model.opt.gravity[:] = np.asarray(gravity_vector) * gravity_scale
-        elif hasattr(base_env, "model"):
-            base_env.model.opt.gravity[:] = np.asarray(gravity_vector) * gravity_scale
-
-    env = RoboHiveSB3Compat(raw_env)
+    gravity_scale = float(config.get("eval_gravity_scale", config.get("gravity_scale", 1.0)))
+    env = RoboHiveSB3Compat(raw_env, gravity_vector=gravity_vector, gravity_scale=gravity_scale)
     return env, raw_env
 
 
@@ -227,6 +261,16 @@ def maybe_render(raw_env: Any, render_enabled: bool):
         raw_env.render()
 
 
+def render_for(raw_env: Any, render_enabled: bool, seconds: float, sleep: float):
+    if not render_enabled or seconds <= 0:
+        return
+    end_time = time.time() + seconds
+    delay = max(float(sleep), 0.01)
+    while time.time() < end_time:
+        maybe_render(raw_env, render_enabled)
+        time.sleep(delay)
+
+
 def write_summary_csv(path: Optional[Path], rows):
     if path is None:
         return
@@ -234,7 +278,22 @@ def write_summary_csv(path: Optional[Path], rows):
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["episode", "return", "length", "solved", "terminated", "truncated"],
+            fieldnames=[
+                "episode",
+                "object_name",
+                "initial_grasp_index",
+                "target_grasp_index",
+                "return",
+                "length",
+                "solved",
+                "terminated",
+                "truncated",
+                "final_pos_err",
+                "final_rot_err",
+                "final_hand_err",
+                "final_contact_count",
+                "dropped",
+            ],
         )
         writer.writeheader()
         writer.writerows(rows)
@@ -248,6 +307,9 @@ def visualize(config: Dict[str, Any]):
     episodes = int(config.get("episodes", 3))
     horizon = int(config.get("horizon", 200))
     sleep = float(config.get("sleep", 0.01))
+    reset_pause = float(config.get("reset_pause", 0.0))
+    episode_pause = float(config.get("episode_pause", 0.0))
+    step_log_interval = int(config.get("step_log_interval", 0))
     deterministic = bool(config.get("deterministic", True))
     seed = int(config.get("seed", 123))
     render_enabled = bool(config.get("render", True))
@@ -259,6 +321,10 @@ def visualize(config: Dict[str, Any]):
     print(f"horizon={horizon}")
     print(f"deterministic={deterministic}")
     print(f"render={render_enabled}")
+    print(f"sleep={sleep}")
+    print(f"reset_pause={reset_pause}")
+    print(f"episode_pause={episode_pause}")
+    print(f"step_log_interval={step_log_interval}")
     print(f"refine_grasp_reset={config.get('refine_grasp_reset', {})}")
 
     rows = []
@@ -268,16 +334,26 @@ def visualize(config: Dict[str, Any]):
 
     try:
         for ep in range(episodes):
-            obs, _ = env.reset(seed=seed + ep)
+            obs, reset_info = env.reset(seed=seed + ep)
+            print(
+                f"episode={ep} start object={reset_info.get('object_name', '')} "
+                f"init={reset_info.get('initial_grasp_index', '')} "
+                f"target={reset_info.get('target_grasp_index', '')} "
+                f"contacts={reset_info.get('contact_count', '')} "
+                f"dropped={reset_info.get('dropped', '')}"
+            )
+            render_for(raw_env, render_enabled, reset_pause, sleep)
             ep_return = 0.0
             ep_len = 0
             solved = False
             terminated = False
             truncated = False
+            final_info = dict(reset_info)
 
             for step in range(horizon):
                 action, _ = model.predict(obs, deterministic=deterministic)
                 obs, reward, terminated, truncated, info = env.step(action)
+                final_info = info
 
                 maybe_render(raw_env, render_enabled)
                 if sleep > 0:
@@ -287,24 +363,50 @@ def visualize(config: Dict[str, Any]):
                 ep_len = step + 1
                 solved = solved or bool(info.get("solved", False))
 
+                should_log_step = step_log_interval > 0 and (
+                    step % step_log_interval == 0 or terminated or truncated
+                )
+                if should_log_step:
+                    print(
+                        f"  step={step:04d} reward={float(reward):.3f} "
+                        f"pos={float(info.get('pos_err', float('nan'))):.4f} "
+                        f"rot={float(info.get('rot_err', float('nan'))):.4f} "
+                        f"hand={float(info.get('hand_err', float('nan'))):.4f} "
+                        f"contacts={info.get('contact_count', '')} "
+                        f"dropped={info.get('dropped', '')} "
+                        f"solved={info.get('solved', '')}"
+                    )
+
                 if stop_on_done and (terminated or truncated):
                     break
+
+            render_for(raw_env, render_enabled, episode_pause, sleep)
 
             solved_count += int(solved)
             returns.append(ep_return)
             lengths.append(ep_len)
             row = {
                 "episode": ep,
+                "object_name": final_info.get("object_name", ""),
+                "initial_grasp_index": final_info.get("initial_grasp_index", ""),
+                "target_grasp_index": final_info.get("target_grasp_index", ""),
                 "return": f"{ep_return:.6f}",
                 "length": ep_len,
                 "solved": int(solved),
                 "terminated": int(terminated),
                 "truncated": int(truncated),
+                "final_pos_err": f"{float(final_info.get('pos_err', float('nan'))):.6f}",
+                "final_rot_err": f"{float(final_info.get('rot_err', float('nan'))):.6f}",
+                "final_hand_err": f"{float(final_info.get('hand_err', float('nan'))):.6f}",
+                "final_contact_count": final_info.get("contact_count", ""),
+                "dropped": int(bool(final_info.get("dropped", False))),
             }
             rows.append(row)
             print(
                 f"episode={ep} return={ep_return:.3f} length={ep_len} "
-                f"solved={solved} terminated={terminated} truncated={truncated}"
+                f"solved={solved} terminated={terminated} truncated={truncated} "
+                f"final_pos={row['final_pos_err']} final_rot={row['final_rot_err']} "
+                f"dropped={row['dropped']}"
             )
     finally:
         env.close()
@@ -349,6 +451,9 @@ def parse_args():
     parser.add_argument("--stochastic", action="store_true", help="Force stochastic actions")
     parser.add_argument("--no-render", action="store_true", help="Do not render; only evaluate and print")
     parser.add_argument("--sleep", type=float, default=None)
+    parser.add_argument("--reset-pause", type=float, default=None)
+    parser.add_argument("--episode-pause", type=float, default=None)
+    parser.add_argument("--step-log-interval", type=int, default=None)
     parser.add_argument("--summary-csv", default=None)
     return parser.parse_args()
 
@@ -381,6 +486,9 @@ def main():
         "seed": args.seed,
         "device": args.device,
         "sleep": args.sleep,
+        "reset_pause": args.reset_pause,
+        "episode_pause": args.episode_pause,
+        "step_log_interval": args.step_log_interval,
         "summary_csv": args.summary_csv,
     }
     for key, value in overrides.items():

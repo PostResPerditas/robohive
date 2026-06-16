@@ -1,0 +1,16 @@
+{
+  "train_config": "scripts/config/refine/train_refine_tabletop_ppo_fixed_base_multi_object.json",
+  "algorithm": "PPO",
+  "model_choice": "best",
+  "device": "cuda",
+  "episodes": 3,
+  "horizon": 300,
+  "seed": 123,
+  "deterministic": true,
+  "render": true,
+  "sleep": 0.05,
+  "reset_pause": 1.5,
+  "episode_pause": 2.0,
+  "step_log_interval": 20,
+  "summary_csv": "runs/refine_tabletop_ppo_fixed_base_multi_object_refinephys_lift8cm_env8_seed0/visual_eval.csv"
+}
