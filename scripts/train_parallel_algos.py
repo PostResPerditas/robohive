@@ -63,6 +63,12 @@ class RoboHiveSB3Compat(gymnasium.Wrapper):
         self._mujoco_model().opt.gravity[:] = self._base_gravity * self._gravity_scale
         return self._gravity_scale
 
+    def set_runtime_param(self, name, value):
+        env = self.env.unwrapped
+        if not hasattr(env, "set_runtime_param"):
+            raise AttributeError(f"Wrapped env does not support set_runtime_param: {type(env)}")
+        return env.set_runtime_param(name, value)
+
     def reset(self, *, seed=None, options=None):
         if seed is not None:
             self.env.unwrapped.seed(seed)
@@ -236,6 +242,58 @@ class GravityCurriculumCallback(BaseCallback):
         return True
 
 
+class EnvParamCurriculumCallback(BaseCallback):
+    """Linearly update runtime env parameters through VecEnv env_method calls."""
+
+    def __init__(self, schedules, update_freq=1000, verbose=0):
+        super().__init__(verbose=verbose)
+        self.schedules = [self._normalize_schedule(schedule) for schedule in schedules]
+        self.update_freq = max(int(update_freq), 1)
+        self._last_values = {}
+
+    @staticmethod
+    def _normalize_schedule(schedule):
+        param = schedule.get("param", schedule.get("name", None))
+        if param is None:
+            raise ValueError(f"env_param_curriculum schedule is missing param/name: {schedule}")
+        return {
+            "param": str(param),
+            "start": float(schedule.get("start", schedule.get("start_value", 0.0))),
+            "end": float(schedule.get("end", schedule.get("end_value", 0.0))),
+            "duration_timesteps": max(int(schedule.get("duration_timesteps", 1)), 1),
+            "start_timestep": max(int(schedule.get("start_timestep", 0)), 0),
+        }
+
+    def _compute_value(self, schedule):
+        if self.num_timesteps <= schedule["start_timestep"]:
+            return schedule["start"]
+        progress = (self.num_timesteps - schedule["start_timestep"]) / schedule["duration_timesteps"]
+        progress = float(np.clip(progress, 0.0, 1.0))
+        return schedule["start"] + progress * (schedule["end"] - schedule["start"])
+
+    def _set_value(self, schedule, value):
+        param = schedule["param"]
+        last_value = self._last_values.get(param, None)
+        if last_value is not None and abs(value - last_value) < 1e-8:
+            return
+        self.training_env.env_method("set_runtime_param", param, value)
+        self._last_values[param] = value
+        if self.verbose > 0:
+            print(f"env_param_curriculum {param}={value:.6g} at timestep={self.num_timesteps}")
+
+    def _apply(self):
+        for schedule in self.schedules:
+            self._set_value(schedule, self._compute_value(schedule))
+
+    def _on_training_start(self):
+        self._apply()
+
+    def _on_step(self):
+        if self.n_calls % self.update_freq == 0:
+            self._apply()
+        return True
+
+
 def build_callbacks(config, run_dir, n_envs):
     callbacks = []
 
@@ -249,6 +307,16 @@ def build_callbacks(config, run_dir, n_envs):
                     "duration_timesteps", config.get("total_timesteps", 100000)
                 ),
                 start_timestep=gravity_cfg.get("start_timestep", 0),
+                verbose=int(config.get("verbose", 1)),
+            )
+        )
+
+    param_cfg = config.get("env_param_curriculum", {})
+    if param_cfg.get("enabled", False):
+        callbacks.append(
+            EnvParamCurriculumCallback(
+                schedules=param_cfg.get("schedules", []),
+                update_freq=param_cfg.get("update_freq", 1000),
                 verbose=int(config.get("verbose", 1)),
             )
         )
@@ -381,6 +449,7 @@ def train(config):
     print(f"gravity_vector={config.get('gravity_vector', 'env_default')}")
     print(f"gravity_scale={float(config.get('gravity_scale', 1.0))}")
     print(f"gravity_curriculum={config.get('gravity_curriculum', {})}")
+    print(f"env_param_curriculum={config.get('env_param_curriculum', {})}")
     print(f"refine_grasp_reset={config.get('refine_grasp_reset', {})}")
     print(f"refine_tabletop={config.get('refine_tabletop', {})}")
     print(f"checkpoint_freq={int(config.get('checkpoint_freq', 0))}")

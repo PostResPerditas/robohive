@@ -22,6 +22,8 @@ Config fields accepted by this script:
     device: "cuda", "cpu", or "auto".
     seed, episodes, horizon, sleep, deterministic.
     reset_pause, episode_pause: seconds to keep rendering before/after each episode.
+    pre_refine_steps: optional policy warmup steps before episode metrics start.
+    pre_refine_gravity_scale: gravity scale used during the warmup phase.
     step_log_interval: print per-step info every N steps. 0 disables step logs.
     render: whether to call raw_env.unwrapped.mj_render().
     summary_csv: optional CSV path for episode-level results.
@@ -292,6 +294,17 @@ def write_summary_csv(path: Optional[Path], rows):
                 "final_rot_err",
                 "final_hand_err",
                 "final_contact_count",
+                "final_thumb_contact_count",
+                "final_opposing_contact_count",
+                "final_opposing_finger_groups",
+                "final_opposition_score",
+                "final_has_thumb_opposition",
+                "final_action_norm",
+                "final_action_scale",
+                "final_hand_weight",
+                "warmup_steps",
+                "warmup_dropped",
+                "warmup_contact_count",
                 "dropped",
             ],
         )
@@ -315,6 +328,12 @@ def visualize(config: Dict[str, Any]):
     render_enabled = bool(config.get("render", True))
     stop_on_done = bool(config.get("stop_on_done", True))
     summary_csv = resolve_project_path(config.get("summary_csv"))
+    pre_refine_steps = int(config.get("pre_refine_steps", 0))
+    pre_refine_gravity_scale = config.get("pre_refine_gravity_scale", None)
+    pre_refine_render = bool(config.get("pre_refine_render", False))
+    pre_refine_sleep = float(config.get("pre_refine_sleep", 0.0))
+    pre_refine_stop_on_done = bool(config.get("pre_refine_stop_on_done", False))
+    eval_gravity_scale = float(config.get("eval_gravity_scale", config.get("gravity_scale", 1.0)))
 
     print(f"env_id={config['env_id']}")
     print(f"episodes={episodes}")
@@ -325,6 +344,8 @@ def visualize(config: Dict[str, Any]):
     print(f"reset_pause={reset_pause}")
     print(f"episode_pause={episode_pause}")
     print(f"step_log_interval={step_log_interval}")
+    print(f"pre_refine_steps={pre_refine_steps}")
+    print(f"pre_refine_gravity_scale={pre_refine_gravity_scale}")
     print(f"refine_grasp_reset={config.get('refine_grasp_reset', {})}")
 
     rows = []
@@ -340,15 +361,44 @@ def visualize(config: Dict[str, Any]):
                 f"init={reset_info.get('initial_grasp_index', '')} "
                 f"target={reset_info.get('target_grasp_index', '')} "
                 f"contacts={reset_info.get('contact_count', '')} "
+                f"thumb={reset_info.get('thumb_contact_count', '')} "
+                f"opp={reset_info.get('opposing_contact_count', '')} "
+                f"opp_score={reset_info.get('opposition_score', '')} "
                 f"dropped={reset_info.get('dropped', '')}"
             )
+            warmup_info = dict(reset_info)
+            warmup_steps_done = 0
+            if pre_refine_steps > 0:
+                if pre_refine_gravity_scale is not None:
+                    env.set_gravity_scale(float(pre_refine_gravity_scale))
+                for warmup_step in range(pre_refine_steps):
+                    action, _ = model.predict(obs, deterministic=deterministic)
+                    obs, _, warmup_terminated, warmup_truncated, warmup_info = env.step(action)
+                    warmup_steps_done = warmup_step + 1
+                    maybe_render(raw_env, render_enabled and pre_refine_render)
+                    if pre_refine_sleep > 0:
+                        time.sleep(pre_refine_sleep)
+                    if pre_refine_stop_on_done and (warmup_terminated or warmup_truncated):
+                        break
+                env.set_gravity_scale(eval_gravity_scale)
+                print(
+                    f"  warmup steps={warmup_steps_done} "
+                    f"gravity={pre_refine_gravity_scale} -> {eval_gravity_scale} "
+                    f"contacts={warmup_info.get('contact_count', '')} "
+                    f"thumb={warmup_info.get('thumb_contact_count', '')} "
+                    f"opp={warmup_info.get('opposing_contact_count', '')} "
+                    f"opp_groups={warmup_info.get('opposing_finger_groups', '')} "
+                    f"opp_score={float(warmup_info.get('opposition_score', float('nan'))):.4f} "
+                    f"dropped={warmup_info.get('dropped', '')}"
+                )
+
             render_for(raw_env, render_enabled, reset_pause, sleep)
             ep_return = 0.0
             ep_len = 0
             solved = False
             terminated = False
             truncated = False
-            final_info = dict(reset_info)
+            final_info = dict(warmup_info)
 
             for step in range(horizon):
                 action, _ = model.predict(obs, deterministic=deterministic)
@@ -373,6 +423,13 @@ def visualize(config: Dict[str, Any]):
                         f"rot={float(info.get('rot_err', float('nan'))):.4f} "
                         f"hand={float(info.get('hand_err', float('nan'))):.4f} "
                         f"contacts={info.get('contact_count', '')} "
+                        f"thumb={info.get('thumb_contact_count', '')} "
+                        f"opp={info.get('opposing_contact_count', '')} "
+                        f"opp_groups={info.get('opposing_finger_groups', '')} "
+                        f"opp_score={float(info.get('opposition_score', float('nan'))):.4f} "
+                        f"action_norm={float(info.get('action_norm', float('nan'))):.4f} "
+                        f"action_scale={float(info.get('action_scale', float('nan'))):.4f} "
+                        f"hand_weight={float(info.get('hand_weight', float('nan'))):.4f} "
                         f"dropped={info.get('dropped', '')} "
                         f"solved={info.get('solved', '')}"
                     )
@@ -399,6 +456,17 @@ def visualize(config: Dict[str, Any]):
                 "final_rot_err": f"{float(final_info.get('rot_err', float('nan'))):.6f}",
                 "final_hand_err": f"{float(final_info.get('hand_err', float('nan'))):.6f}",
                 "final_contact_count": final_info.get("contact_count", ""),
+                "final_thumb_contact_count": final_info.get("thumb_contact_count", ""),
+                "final_opposing_contact_count": final_info.get("opposing_contact_count", ""),
+                "final_opposing_finger_groups": final_info.get("opposing_finger_groups", ""),
+                "final_opposition_score": f"{float(final_info.get('opposition_score', float('nan'))):.6f}",
+                "final_has_thumb_opposition": int(bool(final_info.get("has_thumb_opposition", False))),
+                "final_action_norm": f"{float(final_info.get('action_norm', float('nan'))):.6f}",
+                "final_action_scale": f"{float(final_info.get('action_scale', float('nan'))):.6f}",
+                "final_hand_weight": f"{float(final_info.get('hand_weight', float('nan'))):.6f}",
+                "warmup_steps": warmup_steps_done,
+                "warmup_dropped": int(bool(warmup_info.get("dropped", False))),
+                "warmup_contact_count": warmup_info.get("contact_count", ""),
                 "dropped": int(bool(final_info.get("dropped", False))),
             }
             rows.append(row)
@@ -454,6 +522,8 @@ def parse_args():
     parser.add_argument("--reset-pause", type=float, default=None)
     parser.add_argument("--episode-pause", type=float, default=None)
     parser.add_argument("--step-log-interval", type=int, default=None)
+    parser.add_argument("--pre-refine-steps", type=int, default=None)
+    parser.add_argument("--pre-refine-gravity-scale", type=float, default=None)
     parser.add_argument("--summary-csv", default=None)
     return parser.parse_args()
 
@@ -489,6 +559,8 @@ def main():
         "reset_pause": args.reset_pause,
         "episode_pause": args.episode_pause,
         "step_log_interval": args.step_log_interval,
+        "pre_refine_steps": args.pre_refine_steps,
+        "pre_refine_gravity_scale": args.pre_refine_gravity_scale,
         "summary_csv": args.summary_csv,
     }
     for key, value in overrides.items():

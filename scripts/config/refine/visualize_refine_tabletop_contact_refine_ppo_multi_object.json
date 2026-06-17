@@ -1,0 +1,21 @@
+{
+  "train_config": "scripts/config/refine/train_refine_tabletop_contact_refine_ppo_multi_object.json",
+  "algorithm": "PPO",
+  "model_choice": "best",
+  "device": "cuda",
+  "episodes": 10,
+  "horizon": 300,
+  "seed": 123,
+  "deterministic": true,
+  "render": true,
+  "sleep": 0.05,
+  "reset_pause": 1.5,
+  "episode_pause": 2.0,
+  "step_log_interval": 20,
+  "pre_refine_steps": 80,
+  "pre_refine_gravity_scale": 0.0,
+  "pre_refine_render": false,
+  "pre_refine_sleep": 0.0,
+  "pre_refine_stop_on_done": false,
+  "summary_csv": "runs/refine_tabletop_contact_refine_ppo_multi_object_refinephys_lift8cm_env8_seed0/visual_eval.csv"
+}

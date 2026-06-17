@@ -65,6 +65,25 @@ ACTUATOR_NAMES = [
     "rh_A_LFJ0",
 ]
 
+FINGER_GROUP_PREFIXES = {
+    "thumb": ("rh_th",),
+    "ff": ("rh_ff",),
+    "mf": ("rh_mf",),
+    "rf": ("rh_rf",),
+    "lf": ("rh_lf",),
+    "palm": ("rh_palm",),
+}
+
+OPPOSING_FINGER_GROUPS = ("ff", "mf", "rf", "lf")
+CONTACT_FEATURE_KEYS = [
+    "thumb_contact_count",
+    "opposing_contact_count",
+    "opposing_finger_groups",
+    "palm_contact_count",
+    "opposition_score",
+    "has_thumb_opposition",
+]
+
 
 def resolve_project_path(path: Optional[str]) -> Optional[Path]:
     if path is None or str(path) == "":
@@ -146,6 +165,21 @@ def first_scalar(value, default: float) -> float:
     return float(arr[0]) if arr.size else float(default)
 
 
+def as_optional_range(value, name: str) -> Optional[np.ndarray]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        arr = np.fromstring(value, sep=" ", dtype=np.float64)
+    else:
+        arr = np.asarray(value, dtype=np.float64).reshape(-1)
+    if arr.size == 1:
+        limit = abs(float(arr[0]))
+        return np.asarray([-limit, limit], dtype=np.float64)
+    if arr.size == 2:
+        return arr.astype(np.float64)
+    raise ValueError(f"{name} must have one symmetric limit or two range values, got {arr.size}")
+
+
 class RefineTabletopEnv(gymnasium.Env):
     """Fixed-base ShadowHand tabletop env built from Grasp_Refine assets."""
 
@@ -185,6 +219,7 @@ class RefineTabletopEnv(gymnasium.Env):
         self.hand_xml = resolve_project_path(self.config.get("hand_xml")) or DEFAULT_HAND_XML
         self.action_mode = str(self.config.get("action_mode", "delta")).lower()
         self.action_scale = float(self.config.get("action_scale", 0.15))
+        self._last_action_norm = 0.0
         self._select_entries(initial=True)
         self._load_model_for_current_entries()
         obs = self._get_obs()
@@ -356,7 +391,13 @@ class RefineTabletopEnv(gymnasium.Env):
                 "object_margin": float(self.config.get("object_margin", 0.001)),
                 "hand_margin": float(self.config.get("hand_margin", 0.001)),
                 "plane_margin": float(self.config.get("plane_margin", 0.002)),
-                "schema": 4,
+                "actuator_kp_scale": float(self.config.get("actuator_kp_scale", 1.0)),
+                "actuator_kp": self.config.get("actuator_kp", self.config.get("actuator_kp_override", None)),
+                "actuator_force_scale": float(self.config.get("actuator_force_scale", 1.0)),
+                "actuator_forcerange": self.config.get(
+                    "actuator_forcerange", self.config.get("actuator_force_range", None)
+                ),
+                "schema": 5,
             },
             sort_keys=True,
         )
@@ -366,6 +407,7 @@ class RefineTabletopEnv(gymnasium.Env):
             return xml_path
 
         hand_root = ET.parse(self.hand_xml).getroot()
+        self._apply_hand_actuator_tuning(hand_root)
         object_xml = Path(self.initial_entry["object_xml_path"])
         object_root = ET.parse(object_xml).getroot()
 
@@ -504,6 +546,29 @@ class RefineTabletopEnv(gymnasium.Env):
         ET.ElementTree(root).write(xml_path, encoding="utf-8", xml_declaration=True)
         return xml_path
 
+    def _apply_hand_actuator_tuning(self, hand_root: ET.Element) -> None:
+        kp_scale = float(self.config.get("actuator_kp_scale", 1.0))
+        kp_override = self.config.get("actuator_kp", self.config.get("actuator_kp_override", None))
+        force_scale = float(self.config.get("actuator_force_scale", 1.0))
+        force_override = as_optional_range(
+            self.config.get("actuator_forcerange", self.config.get("actuator_force_range", None)),
+            "actuator_forcerange",
+        )
+        if kp_scale == 1.0 and kp_override is None and force_scale == 1.0 and force_override is None:
+            return
+
+        for actuator in hand_root.iter("position"):
+            if kp_override is not None:
+                actuator.set("kp", f"{float(kp_override):.9g}")
+            elif actuator.get("kp") is not None and kp_scale != 1.0:
+                actuator.set("kp", f"{float(actuator.get('kp')) * kp_scale:.9g}")
+
+            if force_override is not None:
+                actuator.set("forcerange", vec_str(force_override))
+            elif actuator.get("forcerange") is not None and force_scale != 1.0:
+                force_range = as_optional_range(actuator.get("forcerange"), "forcerange")
+                actuator.set("forcerange", vec_str(force_range * force_scale))
+
     def _friction(self) -> np.ndarray:
         if self.config.get("friction") is not None:
             return as_vec(self.config["friction"], 3, "friction")
@@ -573,6 +638,7 @@ class RefineTabletopEnv(gymnasium.Env):
         self.fixed_hand_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "fixed_hand_base")
         self.object_geom_ids = self._descendant_geom_ids(self.object_body_id)
         self.hand_geom_ids = self._descendant_geom_ids(self.fixed_hand_body_id)
+        self.hand_geom_group_by_id = self._hand_geom_groups()
         self.actuator_ids = [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name) for name in ACTUATOR_NAMES]
 
     def _descendant_geom_ids(self, root_body_id: int) -> set:
@@ -588,6 +654,20 @@ class RefineTabletopEnv(gymnasium.Env):
                     break
                 body_id = parent_id
         return geom_ids
+
+    def _hand_geom_groups(self) -> Dict[int, str]:
+        groups = {}
+        for geom_id in self.hand_geom_ids:
+            body_id = int(self.model.geom_bodyid[geom_id])
+            body_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
+            body_name = body_name.lower()
+            group = "other"
+            for candidate, prefixes in FINGER_GROUP_PREFIXES.items():
+                if any(body_name.startswith(prefix) for prefix in prefixes):
+                    group = candidate
+                    break
+            groups[int(geom_id)] = group
+        return groups
 
     def _joint_qpos_addr(self, name: str) -> int:
         joint_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
@@ -610,19 +690,21 @@ class RefineTabletopEnv(gymnasium.Env):
         rot_err = np.asarray([quat_error_angle(object_pose[3:7], self.target_object_pose[3:7])], dtype=np.float64)
         hand_err = hand_qpos - self.target_hand_qpos
         contact_count = np.asarray([float(self._object_hand_contact_count())], dtype=np.float64)
-        return np.concatenate(
-            [
-                hand_qpos,
-                hand_qvel,
-                object_pose,
-                object_vel,
-                self.target_object_pose,
-                pos_err,
-                rot_err,
-                hand_err,
-                contact_count,
-            ]
-        ).astype(np.float32)
+        obs_parts = [
+            hand_qpos,
+            hand_qvel,
+            object_pose,
+            object_vel,
+            self.target_object_pose,
+            pos_err,
+            rot_err,
+            hand_err,
+            contact_count,
+        ]
+        if self.config.get("include_contact_features_in_obs", False):
+            features = self._contact_features()
+            obs_parts.append(np.asarray([float(features[key]) for key in CONTACT_FEATURE_KEYS], dtype=np.float64))
+        return np.concatenate(obs_parts).astype(np.float32)
 
     def _initial_ctrl_from_qpos(self, hand_qpos: np.ndarray) -> np.ndarray:
         qpos_backup = self.data.qpos.copy()
@@ -671,12 +753,14 @@ class RefineTabletopEnv(gymnasium.Env):
         self.data.qpos[self.object_qpos_addr : self.object_qpos_addr + 7] = self.init_object_pose
         self.data.qvel[:] = 0.0
         self.data.ctrl[:] = self.default_ctrl
+        self._last_action_norm = 0.0
         mujoco.mj_forward(self.model, self.data)
         return self._get_obs(), self._info()
 
     def step(self, action):
         action = np.asarray(action, dtype=np.float64).reshape(-1)
         action = np.clip(action, -1.0, 1.0)
+        self._last_action_norm = float(np.mean(np.square(action))) if action.size else 0.0
         if self.action_mode == "absolute":
             ctrl = self.default_ctrl + self.action_scale * action
             ctrl[self.ctrl_limited] = (
@@ -707,12 +791,23 @@ class RefineTabletopEnv(gymnasium.Env):
         pos_err = float(np.linalg.norm(object_pose[:3] - self.target_object_pose[:3]))
         rot_err = float(quat_error_angle(object_pose[3:7], self.target_object_pose[3:7]))
         hand_err = float(np.linalg.norm(hand_qpos - self.target_hand_qpos) / math.sqrt(len(hand_qpos)))
-        contacts = self._object_hand_contact_count()
+        contact_features = self._contact_features()
+        contacts = int(contact_features["contact_count"])
         dropped = self._dropped(object_pose)
-        reward = self._reward(pos_err, rot_err, hand_err, contacts, dropped)
+        reward = self._reward(pos_err, rot_err, hand_err, contact_features, dropped)
+        success_min_contacts = int(self.config.get("success_min_contacts", self.config.get("min_contact_count", 0)))
+        success_min_thumb_contacts = int(self.config.get("success_min_thumb_contacts", 0))
+        success_min_opposing_contacts = int(self.config.get("success_min_opposing_contacts", 0))
+        success_min_opposing_groups = int(self.config.get("success_min_opposing_finger_groups", 0))
+        success_opposition_threshold = float(self.config.get("success_opposition_threshold", -1.0))
         solved = (
             pos_err < float(self.config.get("success_pos_threshold", 0.03))
             and rot_err < float(self.config.get("success_rot_threshold", 0.35))
+            and contacts >= success_min_contacts
+            and int(contact_features["thumb_contact_count"]) >= success_min_thumb_contacts
+            and int(contact_features["opposing_contact_count"]) >= success_min_opposing_contacts
+            and int(contact_features["opposing_finger_groups"]) >= success_min_opposing_groups
+            and float(contact_features["opposition_score"]) >= success_opposition_threshold
             and not dropped
         )
         return {
@@ -721,6 +816,15 @@ class RefineTabletopEnv(gymnasium.Env):
             "rot_err": rot_err,
             "hand_err": hand_err,
             "contact_count": contacts,
+            "thumb_contact_count": int(contact_features["thumb_contact_count"]),
+            "opposing_contact_count": int(contact_features["opposing_contact_count"]),
+            "opposing_finger_groups": int(contact_features["opposing_finger_groups"]),
+            "palm_contact_count": int(contact_features["palm_contact_count"]),
+            "opposition_score": float(contact_features["opposition_score"]),
+            "has_thumb_opposition": bool(contact_features["has_thumb_opposition"]),
+            "action_norm": float(getattr(self, "_last_action_norm", 0.0)),
+            "action_scale": float(self.action_scale),
+            "hand_weight": float(self.config.get("hand_weight", 0.05)),
             "dropped": dropped,
             "solved": solved,
             "fixed_base_pose_wxyz": self.fixed_base_pose.tolist(),
@@ -733,27 +837,124 @@ class RefineTabletopEnv(gymnasium.Env):
             "model_xml_path": str(self.model_xml_path),
         }
 
-    def _reward(self, pos_err, rot_err, hand_err, contacts, dropped) -> float:
+    def _reward(self, pos_err, rot_err, hand_err, contact_features, dropped) -> float:
+        contacts = int(contact_features["contact_count"])
+        thumb_contacts = int(contact_features["thumb_contact_count"])
+        opposing_contacts = int(contact_features["opposing_contact_count"])
+        opposing_groups = int(contact_features["opposing_finger_groups"])
+        opposition_score = float(contact_features["opposition_score"])
         reward = 0.0
         reward -= float(self.config.get("pos_weight", 10.0)) * pos_err
         reward -= float(self.config.get("rot_weight", 1.0)) * rot_err
         reward -= float(self.config.get("hand_weight", 0.05)) * hand_err
         reward += float(self.config.get("contact_bonus", 0.02)) * min(contacts, 5)
+        reward += float(self.config.get("thumb_contact_bonus", 0.0)) * min(thumb_contacts, 3)
+        reward += float(self.config.get("opposing_contact_bonus", 0.0)) * min(opposing_contacts, 5)
+        reward += float(self.config.get("opposing_finger_group_bonus", 0.0)) * opposing_groups
+        if thumb_contacts > 0 and opposing_contacts > 0:
+            reward += float(self.config.get("opposition_bonus", 0.0)) * opposition_score
+        elif contacts == 0:
+            reward -= float(self.config.get("no_contact_penalty", 0.0))
+        min_contacts = int(self.config.get("min_contact_count", 0))
+        if min_contacts > 0 and contacts < min_contacts:
+            reward -= float(self.config.get("contact_loss_penalty", 0.0)) * (min_contacts - contacts)
+        min_thumb_contacts = int(self.config.get("min_thumb_contacts", 0))
+        if min_thumb_contacts > 0 and thumb_contacts < min_thumb_contacts:
+            reward -= float(self.config.get("thumb_contact_loss_penalty", 0.0)) * (
+                min_thumb_contacts - thumb_contacts
+            )
+        min_opposing_contacts = int(self.config.get("min_opposing_contacts", 0))
+        if min_opposing_contacts > 0 and opposing_contacts < min_opposing_contacts:
+            reward -= float(self.config.get("opposing_contact_loss_penalty", 0.0)) * (
+                min_opposing_contacts - opposing_contacts
+            )
+        min_opposing_groups = int(self.config.get("min_opposing_finger_groups", 0))
+        if min_opposing_groups > 0 and opposing_groups < min_opposing_groups:
+            reward -= float(self.config.get("opposing_group_loss_penalty", 0.0)) * (
+                min_opposing_groups - opposing_groups
+            )
+        opposition_threshold = float(self.config.get("min_opposition_score", -1.0))
+        if thumb_contacts > 0 and opposing_contacts > 0 and opposition_score < opposition_threshold:
+            reward -= float(self.config.get("opposition_loss_penalty", 0.0)) * (
+                opposition_threshold - opposition_score
+            )
+        reward += float(self.config.get("alive_bonus", 0.0))
+        reward -= float(self.config.get("action_weight", 0.0)) * float(getattr(self, "_last_action_norm", 0.0))
+        success_min_contacts = int(self.config.get("success_min_contacts", min_contacts))
+        success_min_thumb_contacts = int(self.config.get("success_min_thumb_contacts", min_thumb_contacts))
+        success_min_opposing_contacts = int(self.config.get("success_min_opposing_contacts", min_opposing_contacts))
+        success_min_opposing_groups = int(self.config.get("success_min_opposing_finger_groups", min_opposing_groups))
+        success_opposition_threshold = float(self.config.get("success_opposition_threshold", opposition_threshold))
+        if (
+            pos_err < float(self.config.get("success_pos_threshold", 0.03))
+            and rot_err < float(self.config.get("success_rot_threshold", 0.35))
+            and contacts >= success_min_contacts
+            and thumb_contacts >= success_min_thumb_contacts
+            and opposing_contacts >= success_min_opposing_contacts
+            and opposing_groups >= success_min_opposing_groups
+            and opposition_score >= success_opposition_threshold
+            and not dropped
+        ):
+            reward += float(self.config.get("success_bonus", 0.0))
         if dropped:
             reward -= float(self.config.get("drop_penalty", 10.0))
         return float(reward)
 
-    def _object_hand_contact_count(self) -> int:
-        count = 0
+    def _contact_features(self) -> Dict[str, Any]:
+        counts = {group: 0 for group in ["thumb", *OPPOSING_FINGER_GROUPS, "palm", "other"]}
+        points = {group: [] for group in counts}
+
         for i in range(self.data.ncon):
             contact = self.data.contact[i]
             geom1 = int(contact.geom1)
             geom2 = int(contact.geom2)
-            if (geom1 in self.object_geom_ids and geom2 in self.hand_geom_ids) or (
-                geom2 in self.object_geom_ids and geom1 in self.hand_geom_ids
-            ):
-                count += 1
-        return count
+            if geom1 in self.object_geom_ids and geom2 in self.hand_geom_ids:
+                hand_geom = geom2
+            elif geom2 in self.object_geom_ids and geom1 in self.hand_geom_ids:
+                hand_geom = geom1
+            else:
+                continue
+            group = self.hand_geom_group_by_id.get(hand_geom, "other")
+            counts[group] = counts.get(group, 0) + 1
+            points.setdefault(group, []).append(np.asarray(contact.pos, dtype=np.float64).copy())
+
+        thumb_count = counts.get("thumb", 0)
+        opposing_count = sum(counts.get(group, 0) for group in OPPOSING_FINGER_GROUPS)
+        opposing_groups = sum(1 for group in OPPOSING_FINGER_GROUPS if counts.get(group, 0) > 0)
+        palm_count = counts.get("palm", 0)
+        total_count = thumb_count + opposing_count + palm_count + counts.get("other", 0)
+
+        opposition_score = 0.0
+        if thumb_count > 0 and opposing_count > 0:
+            thumb_center = np.mean(np.asarray(points["thumb"], dtype=np.float64), axis=0)
+            opposing_points = [point for group in OPPOSING_FINGER_GROUPS for point in points.get(group, [])]
+            opposing_center = np.mean(np.asarray(opposing_points, dtype=np.float64), axis=0)
+            object_center = np.asarray(self.data.xpos[self.object_body_id], dtype=np.float64)
+            thumb_vec = thumb_center - object_center
+            opposing_vec = opposing_center - object_center
+            thumb_norm = np.linalg.norm(thumb_vec)
+            opposing_norm = np.linalg.norm(opposing_vec)
+            if thumb_norm > 1e-8 and opposing_norm > 1e-8:
+                cosine = float(np.dot(thumb_vec, opposing_vec) / (thumb_norm * opposing_norm))
+                opposition_score = float(np.clip(-cosine, 0.0, 1.0))
+
+        opposition_threshold = float(self.config.get("thumb_opposition_threshold", 0.25))
+        has_thumb_opposition = bool(
+            thumb_count > 0 and opposing_count > 0 and opposition_score >= opposition_threshold
+        )
+
+        return {
+            "contact_count": int(total_count),
+            "thumb_contact_count": int(thumb_count),
+            "opposing_contact_count": int(opposing_count),
+            "opposing_finger_groups": int(opposing_groups),
+            "palm_contact_count": int(palm_count),
+            "opposition_score": float(opposition_score),
+            "has_thumb_opposition": has_thumb_opposition,
+        }
+
+    def _object_hand_contact_count(self) -> int:
+        return int(self._contact_features()["contact_count"])
 
     def _dropped(self, object_pose) -> bool:
         axis = str(self.initial_entry.get("table_axis", "xz"))
@@ -777,6 +978,13 @@ class RefineTabletopEnv(gymnasium.Env):
         self._gravity_scale = float(gravity_scale)
         self.model.opt.gravity[:] = self._base_gravity * self._gravity_scale
         return self._gravity_scale
+
+    def set_runtime_param(self, name, value):
+        value = float(value)
+        self.config[str(name)] = value
+        if str(name) == "action_scale":
+            self.action_scale = value
+        return value
 
     def render(self):
         if self.viewer is None:

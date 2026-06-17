@@ -208,6 +208,96 @@ python scripts/visualize_algos.py \
   "action_scale": 0.0
 }
 
+# Task1.6
+加入 action_scale=0.0 后只有部分结果保持了稳定，还是存在一些掉落情况，我认为生成的抓取状态应该作为初始化或者参照，而不是直接依赖这个状态，例如学习过程首先实现 Hold 操作，来完成由指定初始状态引导下的抓取状态 2nd-refine
+
+当前新增 Hold/2nd-refine 阶段：目标物体位姿等于初始抬升后的位姿，不做额外重定位旋转；Refine 生成的手形只作为 `default_ctrl` 和 hand-qpos reference，策略通过小动作半径 `action_scale=0.02` 在其附近做二次修正。配置中同时加入了更硬的位置执行器参数 `actuator_kp_scale=2.0`、`actuator_force_scale=3.0`，以及接触保持、不掉落、动作幅度惩罚等 reward 项。
+
+训练 Hold/2nd-refine：
+
+```bash
+python scripts/train_parallel_algos.py \
+  --config scripts/config/refine/train_refine_tabletop_hold_ppo_multi_object.json
+```
+
+可视化 Hold/2nd-refine：
+
+```bash
+python scripts/visualize_algos.py \
+  --config scripts/config/refine/visualize_refine_tabletop_hold_ppo_multi_object.json
+```
+
+无渲染批量评估：
+
+```bash
+python scripts/visualize_algos.py \
+  --config scripts/config/refine/visualize_refine_tabletop_hold_ppo_multi_object.json \
+  --no-render \
+  --episodes 50 \
+  --horizon 500 \
+  --summary-csv runs/refine_tabletop_hold_ppo_multi_object_refinephys_lift8cm_env8_seed0/visual_eval_50.csv
+```
+
+注意：这个阶段不应该设置 `action_scale=0.0` 训练，否则策略没有修正能力；如果只想测试 Refine 抓取在当前环境中的纯保持效果，可以在可视化配置里临时覆盖 `eval_refine_tabletop.action_scale=0.0`。
+
+如果小范围 Hold 仍不足以把困难初始抓取稳定下来，可以使用更强的 grasp-refine 配置。这个版本不再把初始手形当作强目标，而是通过 curriculum 逐步放大手形调整空间：`action_scale` 从 `0.02` 增加到 `0.18`，`hand_weight` 从 `0.5` 降到 `0.02`，让策略从“不要破坏初始抓取”过渡到“主动生成更稳定的闭合手形”。
+
+训练更大手形变化的 grasp-refine：
+
+```bash
+python scripts/train_parallel_algos.py \
+  --config scripts/config/refine/train_refine_tabletop_grasp_refine_ppo_multi_object.json
+```
+
+可视化 grasp-refine：
+
+```bash
+python scripts/visualize_algos.py \
+  --config scripts/config/refine/visualize_refine_tabletop_grasp_refine_ppo_multi_object.json
+```
+
+无渲染批量评估：
+
+```bash
+python scripts/visualize_algos.py \
+  --config scripts/config/refine/visualize_refine_tabletop_grasp_refine_ppo_multi_object.json \
+  --no-render \
+  --episodes 50 \
+  --horizon 100 \
+  --summary-csv runs/refine_tabletop_grasp_refine_ppo_multi_object_refinephys_lift8cm_env8_seed0/visual_eval_50.csv
+```
+
+# Task1.7
+目前我观察到的失败案例主要包含：1. 拇指没有接触上物体，或者没有和其他手指形成对指，导致物体未被稳定抓取；2. 物体较为纤细，被初始化在了环形配置的手指之间，因此没有产生接触就直接掉落；新的 reward 应当考虑判断并鼓励拇指超向其他手指对指状态的物体接触区域；且至少让灵巧手与物体产生接触，为避免直接掉落，也应当考虑重力课程，逐渐增加重力，使得抓取可行；
+还需要确保，在验证阶段，首先就使得抓取配置抵达 rl 训练后的配置，避免中间移动过程中物体已经掉落。
+
+针对上述问题，新增 contact-aware grasp-refine 配置。该配置会把 MuJoCo contact 按 ShadowHand body 名分成 `thumb/ff/mf/rf/lf/palm`，并在 reward/info 中加入 `thumb_contact_count`、`opposing_contact_count`、`opposing_finger_groups`、`opposition_score`、`has_thumb_opposition`。注意：这个配置启用了 `include_contact_features_in_obs=true`，observation 维度和旧 grasp-refine 模型不同，需要重新训练，不能直接加载旧 checkpoint。
+
+训练 contact-aware grasp-refine：
+
+```bash
+python scripts/train_parallel_algos.py \
+  --config scripts/config/refine/train_refine_tabletop_contact_refine_ppo_multi_object.json
+```
+
+可视化 contact-aware grasp-refine：
+
+```bash
+python scripts/visualize_algos.py \
+  --config scripts/config/refine/visualize_refine_tabletop_contact_refine_ppo_multi_object.json
+```
+
+该可视化配置默认先执行 `pre_refine_steps=80`，并在 `pre_refine_gravity_scale=0.0` 下让策略先把手形调整到训练后的 refine 配置，然后恢复 `eval_gravity_scale=1.0` 再开始正式统计和渲染。这样可以避免验证时物体在中间调手形过程中已经因为真实重力直接掉落。
+
+如果想用命令行临时调整 warmup：
+
+```bash
+python scripts/visualize_algos.py \
+  --config scripts/config/refine/visualize_refine_tabletop_contact_refine_ppo_multi_object.json \
+  --pre-refine-steps 120 \
+  --pre-refine-gravity-scale 0.0
+```
+
 # Command
 
 讨论：我希望最终实现桌面抓取 -> 重定位到目标状态的工作；但是我目前存在几个歧路点：1. 目前的重定位操作是手掌向上，这对桌面抓取的情况不符合，因为抓取和重定位过程存在重力约束；2. 目前的 robohive 重定位目标仅包含物体位姿，而不包含包含手指接触在内的约束，例如可以不要求目标状态的所有接触点被重复，但是每根手指代表的接触组应当至少要保持在目标状态附近；3. 考虑到重定位过程中需要保持物体的稳定，我们是否可以考虑依赖优化或者学习策略，对整个重定位过程进行中间阶段生成，用于引导 rl 过程抵达最终状态；4. 如果依赖 3，整体论文的科学性是否会受到干扰；5. 如果依赖上述内容，我们需要预先输入目标状态和初始状态 [如果需要输入初始状态的话]，这样不可避免地会引起随机性的减弱，我担心会影响学习过程，此外，还需要基于先前的 refine 项目生成足够多的抓取候选，这对数量和质量是否存在较高要求。当前存在的问题和可做工作太多，我一时无法想好首先从哪一个点开始，哪一个点最重要。
