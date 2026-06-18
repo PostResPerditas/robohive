@@ -1,0 +1,16 @@
+{
+  "train_config": "scripts/config/refine/train_refine_tabletop_bulk_rotate_ppo.json",
+  "algorithm": "PPO",
+  "model_choice": "best",
+  "device": "cuda",
+  "episodes": 5,
+  "horizon": 200,
+  "seed": 123,
+  "deterministic": true,
+  "render": true,
+  "sleep": 0.05,
+  "reset_pause": 1.0,
+  "episode_pause": 1.5,
+  "step_log_interval": 20,
+  "summary_csv": "runs/refine_tabletop_bulk_rotate_ppo_env8_seed0/visual_eval.csv"
+}

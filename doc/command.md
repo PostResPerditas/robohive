@@ -298,6 +298,172 @@ python scripts/visualize_algos.py \
   --pre-refine-gravity-scale 0.0
 ```
 
-# Command
+# Bulk release grasp set in RoboHive
+新抓取结果位于 `/data/Project/Grasp_Refine/grasp_refine/refine/outputs/grasp_generation_release/final/bulk_release_success_set`。在 RoboHive 中测试前，先用 Refine 的 MuJoCo stability 结果整理出 RoboHive tabletop manifest。
+
+如果还没有生成 stability json，先在 Refine 项目中运行：
+
+```bash
+cd /data/Project/Grasp_Refine
+conda activate refine
+
+python grasp_refine/refine/pipelines/grasp_generation_release/step_05_evaluate_mujoco_stability.py \
+  --input-root grasp_refine/refine/outputs/grasp_generation_release/final/bulk_release_success_set \
+  --output-root grasp_refine/refine/outputs/grasp_generation_release/evaluation/mujoco_stability \
+  --tag bulk_release_success_set \
+  --eval-mode gravity_hold \
+  --qpos-key grasp_qpos
+```
+
+然后在 RoboHive 中整理 manifest：
+
+注意：bulk `.npy` 可能由 NumPy 2.x 保存，而 `robohive` 环境当前可能是 NumPy 1.x；`scripts/refine_grasp_dataset.py` 已加入 `numpy._core` pickle 兼容 alias。如果看到 `No module named 'numpy._core'`，请确认使用的是修改后的脚本。
+
+```bash
+cd /data/Project/robohive
+conda activate robohive
+
+python scripts/refine_grasp_dataset.py \
+  --config scripts/config/refine/refine_grasp_dataset_tabletop.json \
+  --stability-json /data/Project/Grasp_Refine/grasp_refine/refine/outputs/grasp_generation_release/evaluation/mujoco_stability/bulk_release_mujoco_stability.json \
+  --output-dir runs/refine_grasps/bulk_tabletop_stable \
+  --mode tabletop \
+  --qpos-key grasp_qpos \
+  --max-trans 0.05 \
+  --max-rot-deg 15.0 \
+  --min-final-contact-groups 1
+```
+
+输出文件应为：
+
+```text
+runs/refine_grasps/bulk_tabletop_stable/manifest.json
+runs/refine_grasps/bulk_tabletop_stable/grasp_states.npz
+```
+
+优先做不依赖 RL 模型的 zero-action hold 检查，测试新抓取集在当前 RoboHive tabletop 物理配置下是否能保持：
+
+```bash
+python scripts/eval_refine_tabletop_zero_action.py \
+  --config scripts/config/refine/eval_refine_tabletop_bulk_zero_action.json
+```
+
+批量无渲染测试更多 episode：
+
+```bash
+python scripts/eval_refine_tabletop_zero_action.py \
+  --config scripts/config/refine/eval_refine_tabletop_bulk_zero_action.json \
+  --episodes 200 \
+  --horizon 100 \
+  --summary-csv runs/refine_grasps/bulk_tabletop_stable/zero_action_hold_eval_200.csv
+```
+
+如果测试 `bulk_all_stable`，其中会混合 `tabletop` 和 `unconstrained`。为了避免 unconstrained 条目也显示桌面，`scripts/config/refine/eval_refine_tabletop_bulk_all_zero_action.json` 中设置了 `include_table=false`；同时设置 `min_object_height_above_table=0.08`，保证原始高度较低的 unconstrained 抓取在 lift 后至少高出 table 坐标 8cm。可视化命令：
+
+```bash
+python scripts/eval_refine_tabletop_zero_action.py \
+  --config scripts/config/refine/eval_refine_tabletop_bulk_all_zero_action.json \
+  --episodes 5 \
+  --horizon 150 \
+  --render \
+  --sleep 0.03 \
+  --step-log-interval 10
+```
+
+如果要用已有 grasp-refine PPO 模型在 bulk manifest 上做策略评估：
+
+```bash
+python scripts/visualize_algos.py \
+  --config scripts/config/refine/visualize_refine_tabletop_grasp_refine_ppo_bulk_multi_object.json \
+  --no-render \
+  --episodes 50 \
+  --horizon 100 \
+  --summary-csv runs/refine_tabletop_grasp_refine_ppo_multi_object_refinephys_lift8cm_env8_seed0/bulk_visual_eval_50.csv
+```
+
+```bash
+python scripts/eval_refine_tabletop_zero_action.py \
+  --config scripts/config/refine/eval_refine_tabletop_bulk_zero_action.json \
+  --episodes 5 \
+  --horizon 150 \
+  --render \
+  --sleep 0.03 \
+  --step-log-interval 10
+
+python scripts/refine_grasp_dataset.py \
+  --config scripts/config/refine/refine_grasp_dataset_tabletop.json \
+  --stability-json /data/Project/Grasp_Refine/grasp_refine/refine/outputs/grasp_generation_release/evaluation/mujoco_stability/bulk_release_mujoco_stability.json \
+  --output-dir runs/refine_grasps/bulk_all_stable \
+  --mode all \
+  --qpos-key grasp_qpos \
+  --max-trans 0.05 \
+  --max-rot-deg 15.0 \
+  --min-final-contact-groups 1
+
+runs/refine_grasps/bulk_all_stable/manifest.json
+runs/refine_grasps/bulk_all_stable/grasp_states.npz
+
+python scripts/eval_refine_tabletop_zero_action.py \
+  --config scripts/config/refine/eval_refine_tabletop_bulk_all_zero_action.json \
+  --episodes 200 \
+  --horizon 100 \
+  --summary-csv runs/refine_grasps/bulk_all_stable/zero_action_hold_eval_200.csv
+
+python scripts/eval_refine_tabletop_zero_action.py \
+  --config scripts/config/refine/eval_refine_tabletop_bulk_all_zero_action.json \
+  --episodes 5 \
+  --horizon 150 \
+  --render \
+  --sleep 0.03 \
+  --step-log-interval 10
+```
+
+# Task1.8
+理论上而言我们目前的抓取结果都是物理可信的，能把其导入强化学习环境，用来测试手内重定位任务吗，我们可以考虑一个包含重力课程，和转动任务，首先进行这种简答的任务，搭建环境并给我命令。目前我们直接从 tabletop 的结果作为初始化信息，后续我们在引入 unconstaint 项。
+因此我们还需要预先处理，查看相同物体的不同抓取状态，你可以先看筛选后的相同物体有多少个不同状态输入，这样我们用来判断是否需要扩大数据量
+
+当前先只使用 `bulk_tabletop_stable` 中的 tabletop 稳定抓取作为初始化，搭建一个简单手内重定位任务：固定 ShadowHand 基座、移除桌面、整体 lift 后，在重力课程下学习把物体绕桌面法向 `[0, 1, 0]` 旋转 `0.25 rad`。该阶段不使用 unconstrained 条目，后续再单独引入。
+
+先查看筛选后的同物体多抓取状态数量：
+
+```bash
+python scripts/summarize_refine_manifest.py \
+  --manifest runs/refine_grasps/bulk_tabletop_stable/manifest.json \
+  --mode tabletop \
+  --top 30 \
+  --csv runs/refine_grasps/bulk_tabletop_stable/object_counts.csv
+```
+
+当前统计结果：`33` 个 tabletop 稳定抓取，覆盖 `13` 个物体；其中 `7` 个物体至少有 2 个稳定状态，`5` 个物体至少有 3 个稳定状态，`3` 个物体至少有 5 个稳定状态。这个规模可以先做简单旋转任务；如果后续要做“同物体不同目标抓取状态”的目标条件重定位，数据量偏小，需要继续扩大候选。
+
+训练 bulk tabletop 简单旋转任务：
+
+```bash
+python scripts/train_parallel_algos.py \
+  --config scripts/config/refine/train_refine_tabletop_bulk_rotate_ppo.json
+```
+
+可视化训练结果：
+
+```bash
+python scripts/visualize_algos.py \
+  --episodes 50 \
+  --config scripts/config/refine/visualize_refine_tabletop_bulk_rotate_ppo.json
+```
+
+无渲染批量评估：
+
+```bash
+python scripts/visualize_algos.py \
+  --config scripts/config/refine/visualize_refine_tabletop_bulk_rotate_ppo.json \
+  --no-render \
+  --episodes 50 \
+  --horizon 200 \
+  --summary-csv runs/refine_tabletop_bulk_rotate_ppo_env8_seed0/visual_eval_50.csv
+```
+
+配置说明：`train_refine_tabletop_bulk_rotate_ppo.json` 使用 `manifest_path=runs/refine_grasps/bulk_tabletop_stable/manifest.json`、`target_relative_axis=[0,1,0]`、`target_relative_angle=0.25`、`include_table=false`、`lift_distance=0.08`、`gravity_curriculum 0->1`。smoke test 中初始 `rot_err=0.25`，说明目标旋转任务已正确建立。
+
+# 任务
 
 讨论：我希望最终实现桌面抓取 -> 重定位到目标状态的工作；但是我目前存在几个歧路点：1. 目前的重定位操作是手掌向上，这对桌面抓取的情况不符合，因为抓取和重定位过程存在重力约束；2. 目前的 robohive 重定位目标仅包含物体位姿，而不包含包含手指接触在内的约束，例如可以不要求目标状态的所有接触点被重复，但是每根手指代表的接触组应当至少要保持在目标状态附近；3. 考虑到重定位过程中需要保持物体的稳定，我们是否可以考虑依赖优化或者学习策略，对整个重定位过程进行中间阶段生成，用于引导 rl 过程抵达最终状态；4. 如果依赖 3，整体论文的科学性是否会受到干扰；5. 如果依赖上述内容，我们需要预先输入目标状态和初始状态 [如果需要输入初始状态的话]，这样不可避免地会引起随机性的减弱，我担心会影响学习过程，此外，还需要基于先前的 refine 项目生成足够多的抓取候选，这对数量和质量是否存在较高要求。当前存在的问题和可做工作太多，我一时无法想好首先从哪一个点开始，哪一个点最重要。

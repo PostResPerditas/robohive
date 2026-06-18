@@ -356,8 +356,23 @@ class RefineTabletopEnv(gymnasium.Env):
         raise ValueError(f"Unsupported table_axis for lift: {axis}")
 
     def _lift_offset(self, entry: Optional[Dict[str, Any]] = None) -> np.ndarray:
+        entry = entry or self.initial_entry
+        direction = self._table_up_vector(entry)
         distance = float(self.config.get("lift_distance", self.config.get("lift_after_grasp_distance", 0.0)))
-        return self._table_up_vector(entry) * distance
+        offset = direction * distance
+        min_height = self.config.get("min_object_height_above_table", None)
+        if min_height is not None:
+            object_pose = as_vec(
+                entry.get("object_scene_pose_wxyz", entry["object_pose_world_wxyz"]),
+                7,
+                "object pose",
+            )
+            table_pose = as_vec(entry.get("table_pose_wxyz", [0, 0, 0, 1, 0, 0, 0]), 7, "table_pose")
+            clearance = float(np.dot(object_pose[:3] + offset - table_pose[:3], direction))
+            extra = float(min_height) - clearance
+            if extra > 0.0:
+                offset = offset + direction * extra
+        return offset
 
     def _pose_with_lift(self, pose, entry: Optional[Dict[str, Any]] = None) -> np.ndarray:
         pose = as_vec(pose, 7, "pose").copy()
@@ -381,6 +396,8 @@ class RefineTabletopEnv(gymnasium.Env):
                 "target_index": self.target_index,
                 "lift_distance": float(self.config.get("lift_distance", self.config.get("lift_after_grasp_distance", 0.0))),
                 "lift_direction": self.config.get("lift_direction", None),
+                "min_object_height_above_table": self.config.get("min_object_height_above_table", None),
+                "include_table": bool(self.config.get("include_table", True)),
                 "target_pose": self._target_object_pose_from_entries().round(9).tolist(),
                 "integrator": self.config.get("integrator", "implicitfast"),
                 "timestep": float(self.config.get("timestep", 0.004)),
@@ -397,7 +414,7 @@ class RefineTabletopEnv(gymnasium.Env):
                 "actuator_forcerange": self.config.get(
                     "actuator_forcerange", self.config.get("actuator_force_range", None)
                 ),
-                "schema": 5,
+                "schema": 6,
             },
             sort_keys=True,
         )
@@ -458,24 +475,25 @@ class RefineTabletopEnv(gymnasium.Env):
         worldbody = ET.SubElement(root, "worldbody")
         ET.SubElement(worldbody, "light", {"pos": "0 -1 1", "dir": "0 1 -1", "diffuse": "0.8 0.8 0.8"})
         ET.SubElement(worldbody, "camera", {"name": "fixed", "pos": "0 -0.55 0.55", "euler": "0.8 0 0"})
-        table_pose = as_vec(self.initial_entry.get("table_pose_wxyz", [0, 0, 0, 1, 0, 0, 0]), 7, "table_pose")
-        table_size = as_vec(self.initial_entry.get("table_size", [0.34, 0.34, 0.01]), 3, "table_size")
-        ET.SubElement(
-            worldbody,
-            "geom",
-            {
-                "name": "table",
-                "type": "plane",
-                "pos": vec_str(table_pose[:3]),
-                "quat": vec_str(table_pose[3:7]),
-                "size": vec_str(table_size),
-                "friction": vec_str(friction),
-                "condim": "4",
-                "margin": str(float(self.config.get("plane_margin", 0.002))),
-                "contype": "4",
-                "conaffinity": "2",
-            },
-        )
+        if bool(self.config.get("include_table", True)):
+            table_pose = as_vec(self.initial_entry.get("table_pose_wxyz", [0, 0, 0, 1, 0, 0, 0]), 7, "table_pose")
+            table_size = as_vec(self.initial_entry.get("table_size", [0.34, 0.34, 0.01]), 3, "table_size")
+            ET.SubElement(
+                worldbody,
+                "geom",
+                {
+                    "name": "table",
+                    "type": "plane",
+                    "pos": vec_str(table_pose[:3]),
+                    "quat": vec_str(table_pose[3:7]),
+                    "size": vec_str(table_size),
+                    "friction": vec_str(friction),
+                    "condim": "4",
+                    "margin": str(float(self.config.get("plane_margin", 0.002))),
+                    "contype": "4",
+                    "conaffinity": "2",
+                },
+            )
 
         hand_pose = self._pose_with_lift(
             as_vec(self.initial_entry["refine_hand_pose_world_wxyz"], 7, "hand pose"),
@@ -830,6 +848,7 @@ class RefineTabletopEnv(gymnasium.Env):
             "fixed_base_pose_wxyz": self.fixed_base_pose.tolist(),
             "initial_grasp_index": self.initial_index,
             "target_grasp_index": self.target_index,
+            "mode": self.initial_entry.get("mode", ""),
             "lift_offset": self._lift_offset(self.initial_entry).tolist(),
             "object_name": self.initial_entry.get("object_name", ""),
             "object_density": float(self._object_density_from_config()),

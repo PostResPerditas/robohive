@@ -1,5 +1,7 @@
 import argparse
+import importlib
 import json
+import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -99,7 +101,32 @@ def load_json(path: Path) -> Dict[str, Any]:
         return json.load(f)
 
 
+def install_numpy_core_pickle_aliases() -> None:
+    """Allow NumPy 1.x to unpickle arrays saved by NumPy 2.x."""
+    if "numpy._core" in sys.modules:
+        return
+    try:
+        import numpy.core as numpy_core
+    except Exception:
+        return
+
+    sys.modules.setdefault("numpy._core", numpy_core)
+    for module_name in [
+        "multiarray",
+        "numeric",
+        "_multiarray_umath",
+        "fromnumeric",
+        "shape_base",
+    ]:
+        try:
+            module = importlib.import_module(f"numpy.core.{module_name}")
+        except Exception:
+            continue
+        sys.modules.setdefault(f"numpy._core.{module_name}", module)
+
+
 def load_npy_dict(path: Path) -> Dict[str, Any]:
+    install_numpy_core_pickle_aliases()
     data = np.load(path, allow_pickle=True)
     if isinstance(data, np.ndarray):
         data = data.item()
