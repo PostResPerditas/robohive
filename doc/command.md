@@ -400,6 +400,17 @@ python scripts/refine_grasp_dataset.py \
   --max-rot-deg 15.0 \
   --min-final-contact-groups 1
 
+# 新数据、所有结果
+python scripts/refine_grasp_dataset.py \
+  --config scripts/config/refine/refine_grasp_dataset_tabletop.json \
+  --stability-json /data/Project/Grasp_Refine/grasp_refine/refine/outputs/grasp_generation_release/evaluation/mujoco_stability/bulk_release_set_mujoco_stability.json \
+  --output-dir runs/refine_grasps/bulk_set_all_stable \
+  --mode all \
+  --qpos-key grasp_qpos \
+  --max-trans 0.05 \
+  --max-rot-deg 15.0 \
+  --min-final-contact-groups 1
+
 runs/refine_grasps/bulk_all_stable/manifest.json
 runs/refine_grasps/bulk_all_stable/grasp_states.npz
 
@@ -408,6 +419,62 @@ python scripts/eval_refine_tabletop_zero_action.py \
   --episodes 200 \
   --horizon 100 \
   --summary-csv runs/refine_grasps/bulk_all_stable/zero_action_hold_eval_200.csv
+
+# 过滤无效项
+python scripts/filter_refine_tabletop_stable.py \
+  --config scripts/config/refine/eval_refine_tabletop_bulk_all_zero_action.json \
+  --manifest-path runs/refine_grasps/bulk_set_all_stable/manifest.json \
+  --output-dir runs/refine_grasps/bulk_set_all_stable_hold_filtered \
+  --summary-csv runs/refine_grasps/bulk_set_all_stable_hold_filtered/hold_filter_eval.csv \
+  --horizon 100 \
+  --progress-interval 25
+
+# 新数据、测试
+python scripts/eval_refine_tabletop_zero_action.py \
+  --config scripts/config/refine/eval_refine_tabletop_bulk_all_zero_action.json \
+  --episodes 200 \
+  --horizon 100 \
+  --summary-csv runs/refine_grasps/bulk_set_all_stable_hold_filtered/zero_action_hold_eval_200.csv \
+  --manifest-path runs/refine_grasps/bulk_set_all_stable_hold_filtered/manifest.json
+
+# 基准重定位
+python scripts/canonicalize_refine_hand_base.py \
+  --manifest-path runs/refine_grasps/bulk_set_all_stable_hold_filtered/manifest.json \
+  --output-dir runs/refine_grasps/bulk_set_all_stable_hold_filtered_canonical_base \
+  --base-entry-index 0
+
+# 重定位后删选
+python scripts/filter_refine_tabletop_stable.py \
+  --config scripts/config/refine/eval_refine_tabletop_bulk_all_zero_action.json \
+  --manifest-path runs/refine_grasps/bulk_set_all_stable_hold_filtered_canonical_base/manifest.json \
+  --output-dir runs/refine_grasps/bulk_set_all_stable_hold_filtered_canonical_base_revalidated \
+  --summary-csv runs/refine_grasps/bulk_set_all_stable_hold_filtered_canonical_base_revalidated/hold_filter_eval.csv \
+  --horizon 100 \
+  --progress-interval 25
+
+# 可视化结果
+python scripts/eval_refine_tabletop_zero_action.py \
+  --config scripts/config/refine/eval_refine_tabletop_bulk_all_zero_action.json \
+  --manifest-path runs/refine_grasps/bulk_set_all_stable_hold_filtered_canonical_base_revalidated/manifest.json \
+  --episodes 10 \
+  --horizon 100 \
+  --render \
+  --sleep 0.03 \
+  --step-log-interval 10 \
+  --summary-csv runs/refine_grasps/bulk_set_all_stable_hold_filtered_canonical_base_revalidated/visual_check.csv
+
+# 可视化重力
+python scripts/eval_refine_tabletop_zero_action.py \
+  --config scripts/config/refine/eval_refine_tabletop_bulk_all_zero_action.json \
+  --manifest-path runs/refine_grasps/bulk_set_all_stable_hold_filtered_canonical_base_revalidated/manifest.json \
+  --episodes 50 \
+  --horizon 120 \
+  --render \
+  --sleep 0.04 \
+  --step-log-interval 10 \
+  --show-gravity-marker \
+  --gravity-marker-length 0.35 \
+  --gravity-marker-radius 0.012
 
 python scripts/eval_refine_tabletop_zero_action.py \
   --config scripts/config/refine/eval_refine_tabletop_bulk_all_zero_action.json \

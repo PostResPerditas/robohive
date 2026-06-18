@@ -525,6 +525,9 @@ def parse_args():
     parser.add_argument("--pre-refine-steps", type=int, default=None)
     parser.add_argument("--pre-refine-gravity-scale", type=float, default=None)
     parser.add_argument("--summary-csv", default=None)
+    parser.add_argument("--show-gravity-marker", "--show_gravity_marker", dest="show_gravity_marker", action="store_true")
+    parser.add_argument("--gravity-marker-length", "--gravity_marker_length", dest="gravity_marker_length", type=float, default=None)
+    parser.add_argument("--gravity-marker-radius", "--gravity_marker_radius", dest="gravity_marker_radius", type=float, default=None)
     return parser.parse_args()
 
 
@@ -573,6 +576,17 @@ def main():
         config["deterministic"] = False
     if args.no_render:
         config["render"] = False
+
+    env_overrides = {
+        "show_gravity_marker": True if args.show_gravity_marker else None,
+        "gravity_marker_length": args.gravity_marker_length,
+        "gravity_marker_radius": args.gravity_marker_radius,
+    }
+    env_overrides = {key: value for key, value in env_overrides.items() if value is not None}
+    if env_overrides:
+        env_key = "eval_refine_tabletop" if "eval_refine_tabletop" in config else "refine_tabletop"
+        config.setdefault(env_key, {})
+        config[env_key].update(env_overrides)
 
     if "env_id" not in config:
         raise ValueError("env_id is required. Provide it in config or train_config.")

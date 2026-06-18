@@ -398,6 +398,13 @@ class RefineTabletopEnv(gymnasium.Env):
                 "lift_direction": self.config.get("lift_direction", None),
                 "min_object_height_above_table": self.config.get("min_object_height_above_table", None),
                 "include_table": bool(self.config.get("include_table", True)),
+                "show_gravity_marker": bool(self.config.get("show_gravity_marker", False)),
+                "gravity_marker_length": float(self.config.get("gravity_marker_length", 0.12)),
+                "gravity_marker_radius": float(self.config.get("gravity_marker_radius", 0.004)),
+                "gravity_marker_group": int(self.config.get("gravity_marker_group", 0)),
+                "gravity_marker_pos": self.config.get("gravity_marker_pos", None),
+                "gravity_marker_offset": self.config.get("gravity_marker_offset", [0.0, 0.0, 0.16]),
+                "gravity_marker_rgba": self.config.get("gravity_marker_rgba", [1.0, 0.05, 0.05, 0.75]),
                 "target_pose": self._target_object_pose_from_entries().round(9).tolist(),
                 "integrator": self.config.get("integrator", "implicitfast"),
                 "timestep": float(self.config.get("timestep", 0.004)),
@@ -555,6 +562,8 @@ class RefineTabletopEnv(gymnasium.Env):
                 "rgba": "0 1 0 0.5",
             },
         )
+        if bool(self.config.get("show_gravity_marker", False)):
+            self._add_gravity_marker(worldbody, hand_pose)
 
         for section_name in ["contact", "tendon", "actuator"]:
             section = hand_root.find(section_name)
@@ -563,6 +572,50 @@ class RefineTabletopEnv(gymnasium.Env):
 
         ET.ElementTree(root).write(xml_path, encoding="utf-8", xml_declaration=True)
         return xml_path
+
+    def _add_gravity_marker(self, worldbody: ET.Element, hand_pose: np.ndarray) -> None:
+        gravity = as_vec(self.config.get("gravity_vector", [0.0, -9.81, 0.0]), 3, "gravity_vector")
+        gravity_norm = np.linalg.norm(gravity)
+        if gravity_norm < 1e-8:
+            return
+        if self.config.get("gravity_marker_pos") is not None:
+            start = as_vec(self.config.get("gravity_marker_pos"), 3, "gravity_marker_pos")
+        else:
+            offset = as_vec(self.config.get("gravity_marker_offset", [0.0, 0.0, 0.16]), 3, "gravity_marker_offset")
+            start = np.asarray(hand_pose[:3], dtype=np.float64) + offset
+        length = float(self.config.get("gravity_marker_length", 0.12))
+        radius = float(self.config.get("gravity_marker_radius", 0.004))
+        group = str(int(self.config.get("gravity_marker_group", 0)))
+        end = start + gravity / gravity_norm * length
+        rgba = as_vec(self.config.get("gravity_marker_rgba", [1.0, 0.05, 0.05, 0.75]), 4, "gravity_marker_rgba")
+        ET.SubElement(
+            worldbody,
+            "geom",
+            {
+                "name": "gravity_direction",
+                "type": "capsule",
+                "fromto": vec_str([*start, *end]),
+                "size": str(radius),
+                "rgba": vec_str(rgba),
+                "contype": "0",
+                "conaffinity": "0",
+                "group": group,
+            },
+        )
+        ET.SubElement(
+            worldbody,
+            "geom",
+            {
+                "name": "gravity_direction_tip",
+                "type": "sphere",
+                "pos": vec_str(end),
+                "size": str(radius * 2.5),
+                "rgba": vec_str(rgba),
+                "contype": "0",
+                "conaffinity": "0",
+                "group": group,
+            },
+        )
 
     def _apply_hand_actuator_tuning(self, hand_root: ET.Element) -> None:
         kp_scale = float(self.config.get("actuator_kp_scale", 1.0))

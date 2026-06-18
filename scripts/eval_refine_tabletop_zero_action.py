@@ -92,7 +92,8 @@ def evaluate(config: Dict[str, Any]):
             action = np.zeros(env.action_space.shape, dtype=np.float32)
             ep_return = 0.0
             ep_len = 0
-            solved = bool(info.get("solved", False))
+            ever_solved = bool(info.get("solved", False))
+            any_dropped = bool(info.get("dropped", False))
             terminated = False
             truncated = False
             final_info = dict(info)
@@ -111,7 +112,8 @@ def evaluate(config: Dict[str, Any]):
                 final_info = dict(info)
                 ep_return += float(reward)
                 ep_len = step + 1
-                solved = solved or bool(info.get("solved", False))
+                ever_solved = ever_solved or bool(info.get("solved", False))
+                any_dropped = any_dropped or bool(info.get("dropped", False))
 
                 if render:
                     env.render()
@@ -131,6 +133,8 @@ def evaluate(config: Dict[str, Any]):
                 if stop_on_done and (terminated or truncated):
                     break
 
+            dropped = any_dropped or bool(final_info.get("dropped", False))
+            solved = bool(final_info.get("solved", False)) and not dropped
             row = {
                 "episode": ep,
                 "object_name": final_info.get("object_name", ""),
@@ -151,16 +155,16 @@ def evaluate(config: Dict[str, Any]):
                 "final_opposing_finger_groups": final_info.get("opposing_finger_groups", ""),
                 "final_opposition_score": f"{float(final_info.get('opposition_score', float('nan'))):.6f}",
                 "lift_offset": final_info.get("lift_offset", ""),
-                "dropped": int(bool(final_info.get("dropped", False))),
+                "dropped": int(dropped),
             }
             rows.append(row)
             returns.append(ep_return)
             lengths.append(ep_len)
             solved_count += int(solved)
-            dropped_count += int(bool(final_info.get("dropped", False)))
+            dropped_count += int(dropped)
             print(
                 f"episode={ep} return={ep_return:.3f} length={ep_len} "
-                f"solved={solved} dropped={row['dropped']} "
+                f"solved={solved} ever_solved={ever_solved} dropped={row['dropped']} "
                 f"final_pos={row['final_pos_err']} final_rot={row['final_rot_err']} "
                 f"contacts={row['final_contact_count']}"
             )
@@ -181,7 +185,15 @@ def parse_args():
     parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--horizon", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--summary-csv", default=None)
+    parser.add_argument("--summary-csv", "--summary_csv", dest="summary_csv", default=None)
+    parser.add_argument("--manifest-path", "--manifest_path", dest="manifest_path", default=None)
+    parser.add_argument("--sample-mode", "--sample_mode", dest="sample_mode", default=None)
+    parser.add_argument("--initial-grasp-index", "--initial_grasp_index", dest="initial_grasp_index", type=int, default=None)
+    parser.add_argument("--target-grasp-index", "--target_grasp_index", dest="target_grasp_index", type=int, default=None)
+    parser.add_argument("--object-name", "--object_name", dest="object_name", default=None)
+    parser.add_argument("--show-gravity-marker", "--show_gravity_marker", dest="show_gravity_marker", action="store_true")
+    parser.add_argument("--gravity-marker-length", "--gravity_marker_length", dest="gravity_marker_length", type=float, default=None)
+    parser.add_argument("--gravity-marker-radius", "--gravity_marker_radius", dest="gravity_marker_radius", type=float, default=None)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--sleep", type=float, default=None)
     parser.add_argument("--step-log-interval", type=int, default=None)
@@ -200,6 +212,21 @@ def main():
         "step_log_interval": args.step_log_interval,
     }
     config.update({key: value for key, value in overrides.items() if value is not None})
+    env_overrides = {
+        "manifest_path": args.manifest_path,
+        "sample_mode": args.sample_mode,
+        "initial_grasp_index": args.initial_grasp_index,
+        "target_grasp_index": args.target_grasp_index,
+        "object_name": args.object_name,
+        "show_gravity_marker": True if args.show_gravity_marker else None,
+        "gravity_marker_length": args.gravity_marker_length,
+        "gravity_marker_radius": args.gravity_marker_radius,
+    }
+    env_overrides = {key: value for key, value in env_overrides.items() if value is not None}
+    if env_overrides:
+        env_key = "eval_refine_tabletop" if "eval_refine_tabletop" in config else "refine_tabletop"
+        config.setdefault(env_key, {})
+        config[env_key].update(env_overrides)
     if args.render:
         config["render"] = True
     print(f"config={args.config}")
